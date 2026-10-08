@@ -42,6 +42,7 @@ function allowedStreamUrl(raw, session = null) {
 
     // Allow the CDN hostname returned by the authenticated playback session.
     // This avoids breaking when the stream provider rotates CDN hostnames.
+    const sessionHosts = session?.allowedHosts || new Set();
     const sessionHost = session?.streamUrl
       ? new URL(session.streamUrl).hostname
       : "";
@@ -51,7 +52,9 @@ function allowedStreamUrl(raw, session = null) {
     ) || (sessionHost && (
       u.hostname === sessionHost ||
       u.hostname.endsWith("." + sessionHost)
-    ));
+    )) || [...sessionHosts].some(h =>
+      u.hostname === h || u.hostname.endsWith("." + h)
+    );
   } catch {
     return false;
   }
@@ -88,7 +91,8 @@ function newSession(data) {
     createdAt: Date.now(),
     wrappedKey: null,
     keyUrl: null,
-    variantUrl: null
+    variantUrl: null,
+    allowedHosts: new Set([new URL(data.stream_url).hostname])
   });
   return id;
 }
@@ -249,6 +253,7 @@ app.get("/api/stream/manifest/:sessionId", async (req, res) => {
 });
 
 async function rewritePlaylist(sessionId, session, text, baseUrl, res) {
+  try { session.allowedHosts.add(new URL(baseUrl).hostname); } catch {}
   const lines = text.split(/\r?\n/);
   const out = [];
 
@@ -310,7 +315,7 @@ app.get("/api/stream/segment/:sessionId/:encodedUrl", async (req, res) => {
   try { url = Buffer.from(req.params.encodedUrl, "base64url").toString("utf8"); }
   catch { return jsonError(res, 400, "رابط segment غير صالح"); }
 
-  if (!allowedStreamUrl(url)) return jsonError(res, 403, "رابط segment غير مسموح");
+  if (!allowedStreamUrl(url, session)) return jsonError(res, 403, "رابط segment غير مسموح");
 
   try {
     const upstream = await streamFetch(session, url, {
