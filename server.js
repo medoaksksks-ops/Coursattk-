@@ -14,6 +14,15 @@ const AUTH_TOKEN = process.env.COURSATK_TOKEN || "";
 const YEAR_ID = Number(process.env.COURSATK_YEAR_ID || 4);
 const STREAM_HOSTS = (process.env.STREAM_HOSTS || "api.coursatk.online,stream-weave.com")
   .split(",").map(s => s.trim()).filter(Boolean);
+
+// Upstream CDN request headers used by the original player.
+// Keep them configurable in Railway Variables so rotating app/WebView setups
+// do not require another server edit.
+const STREAM_ORIGIN = process.env.STREAM_ORIGIN || "https://coursatk.online";
+const STREAM_REFERER = process.env.STREAM_REFERER || "https://coursatk.online/";
+const STREAM_X_REQUESTED_WITH = process.env.STREAM_X_REQUESTED_WITH || "com.mycompany.app.soulbrowser";
+const STREAM_USER_AGENT = process.env.STREAM_USER_AGENT || "";
+
 const SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_PROXY_BYTES = 8 * 1024 * 1024;
 
@@ -107,21 +116,44 @@ function getSession(id) {
   return s;
 }
 
-async function streamFetch(session, url, extra = {}) {
+async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) {
     throw new Error(`Stream URL غير مسموح: ${url}`);
   }
 
-  // Match the userscript player request shape: Bearer playback token,
-  // no-cache, and no extra authentication scheme. Preserve Range for HLS.
-  return fetch(url, {
-    headers: {
-      Authorization: `Bearer ${session.token}`,
-      Accept: "*/*",
-      "Cache-Control": "no-cache",
-      ...extra
-    }
-  });
+  const ch = clientHeaders || {};
+  const headers = {
+    Authorization: `Bearer ${session.token}`,
+    Accept: "*/*",
+    "Cache-Control": "no-cache",
+    Origin: STREAM_ORIGIN,
+    Referer: STREAM_REFERER,
+    "X-Requested-With": STREAM_X_REQUESTED_WITH,
+    // Prefer the real browser/WebView UA that reached Railway; otherwise use
+    // the optional Railway override. Never send Node/undici's default UA.
+    "User-Agent": ch["user-agent"] || STREAM_USER_AGENT ||
+      "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/153.0.0.0 Mobile Safari/537.36"
+  };
+
+  // Forward the client hints/fetch metadata present on the original player
+  // request when available. These are optional but some CDNs validate them.
+  for (const name of [
+    "sec-ch-ua-platform",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-fetch-site",
+    "sec-fetch-mode",
+    "sec-fetch-dest",
+    "accept-language"
+  ]) {
+    if (ch[name]) headers[name] = ch[name];
+  }
+
+  for (const [name, value] of Object.entries(extra || {})) {
+    if (value !== undefined && value !== null && value !== "") headers[name] = value;
+  }
+
+  return fetch(url, { headers, cache: "no-store" });
 }
 
 // ---------------- API mirror ----------------
@@ -225,7 +257,7 @@ app.get("/api/stream/manifest/:sessionId", async (req, res) => {
   if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
 
   try {
-    const master = await streamFetch(session, session.streamUrl);
+    const master = await streamFetch(session, session.streamUrl, {}, req.headers);
     if (!master.ok) throw new Error(`Stream master HTTP ${master.status}`);
     const masterText = await master.text();
 
@@ -243,22 +275,22 @@ app.get("/api/stream/manifest/:sessionId", async (req, res) => {
     }
 
     if (variant) {
-      const variantRes = await streamFetch(session, variant);
+      const variantRes = await streamFetch(session, variant, {}, req.headers);
       if (!variantRes.ok) throw new Error(`Variant HTTP ${variantRes.status}`);
       const variantText = await variantRes.text();
       session.variantUrl = variant;
 
-      return rewritePlaylist(req.params.sessionId, session, variantText, variant, res);
+      return rewritePlaylist(req.params.sessionId, session, variantText, variant, res, req.headers);
     }
 
     session.variantUrl = session.streamUrl;
-    return rewritePlaylist(req.params.sessionId, session, masterText, session.streamUrl, res);
+    return rewritePlaylist(req.params.sessionId, session, masterText, session.streamUrl, res, req.headers);
   } catch (e) {
     jsonError(res, 502, e.message);
   }
 });
 
-async function rewritePlaylist(sessionId, session, text, baseUrl, res) {
+async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHeaders = null) {
   try { session.allowedHosts.add(new URL(baseUrl).hostname); } catch {}
   const lines = text.split(/\r?\n/);
   const out = [];
@@ -271,7 +303,7 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res) {
       if (uri) {
         session.keyUrl = absoluteUrl(uri, baseUrl);
         try { session.allowedHosts.add(new URL(session.keyUrl).hostname); } catch {}
-        const keyRes = await streamFetch(session, session.keyUrl);
+        const keyRes = await streamFetch(session, session.keyUrl, {}, clientHeaders);
         if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
         session.wrappedKey = Buffer.from(await keyRes.arrayBuffer());
 
@@ -333,10 +365,16 @@ app.get("/api/stream/segment/:sessionId/:encodedUrl", async (req, res) => {
   try {
     const upstream = await streamFetch(session, url, {
       Range: req.headers.range || undefined
-    });
+    }, req.headers);
 
     if (!upstream.ok && upstream.status !== 206) {
-      throw new Error(`Segment HTTP ${upstream.status}`);
+      const upstreamType = upstream.headers.get("content-type") || "";
+      let detail = `Segment HTTP ${upstream.status}`;
+      if (upstream.status === 403) {
+        detail += ` (CDN رفض الطلب؛ Origin/Referer/X-Requested-With/User-Agent تم تمريرها)`;
+        if (upstreamType.includes("text/html")) detail += " [HTML response]";
+      }
+      throw new Error(detail);
     }
 
     const contentType = upstream.headers.get("content-type") || "video/mp2t";
