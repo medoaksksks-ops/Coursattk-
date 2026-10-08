@@ -1,7 +1,20 @@
+/**
+ * Coursatk Railway proxy — server-side AES key unwrap
+ * Matches the working userscript (v6): decryptPlaybackKey(wrapped, video_id)
+ * then serve the plain 16-byte AES-128 key to HLS.js / native HLS.
+ */
 import express from "express";
 import cors from "cors";
 import compression from "compression";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+import vm from "node:vm";
+import { fileURLToPath } from "node:url";
+
+const require = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 app.use(cors());
@@ -15,9 +28,6 @@ const YEAR_ID = Number(process.env.COURSATK_YEAR_ID || 4);
 const STREAM_HOSTS = (process.env.STREAM_HOSTS || "api.coursatk.online,stream-weave.com")
   .split(",").map(s => s.trim()).filter(Boolean);
 
-// Upstream CDN request headers used by the original player.
-// Keep them configurable in Railway Variables so rotating app/WebView setups
-// do not require another server edit.
 const STREAM_ORIGIN = process.env.STREAM_ORIGIN || "https://coursatk.online";
 const STREAM_REFERER = process.env.STREAM_REFERER || "https://coursatk.online/";
 const STREAM_X_REQUESTED_WITH = process.env.STREAM_X_REQUESTED_WITH || "com.mycompany.app.soulbrowser";
@@ -25,11 +35,119 @@ const STREAM_USER_AGENT = process.env.STREAM_USER_AGENT || "";
 
 const SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_PROXY_BYTES = 8 * 1024 * 1024;
+const PLAYER_JS_URL = process.env.PLAYER_JS_URL || "https://player.stream-weave.com/assets/player.js?v=1.1.1";
 
 if (!AUTH_TOKEN) {
   console.warn("[Coursatk] COURSATK_TOKEN is missing. Set it in Railway Variables.");
 }
 
+// ---------------------------------------------------------------------------
+// Load Stream-Weave DecryptionUtils once (same crypto the userscript uses)
+// ---------------------------------------------------------------------------
+let decryptPlaybackKey = null;
+
+async function loadDecryptionUtils() {
+  let source;
+  const cachePath = path.join(__dirname, "player.stream-weave.cache.js");
+  try {
+    if (fs.existsSync(cachePath)) {
+      source = fs.readFileSync(cachePath, "utf8");
+      console.log("[Coursatk] loaded player.js from cache");
+    }
+  } catch {}
+
+  if (!source) {
+    console.log("[Coursatk] fetching player.js …");
+    const r = await fetch(PLAYER_JS_URL, {
+      headers: { "User-Agent": "Mozilla/5.0", Accept: "*/*" }
+    });
+    if (!r.ok) throw new Error(`player.js HTTP ${r.status}`);
+    source = await r.text();
+    try { fs.writeFileSync(cachePath, source); } catch {}
+  }
+
+  const { webcrypto } = crypto;
+  const sandbox = {
+    window: {},
+    self: {},
+    globalThis: {},
+    global: {},
+    console: { log() {}, warn() {}, error() {}, info() {} },
+    crypto: webcrypto,
+    TextEncoder,
+    TextDecoder,
+    Uint8Array,
+    ArrayBuffer,
+    atob: (s) => Buffer.from(s, "base64").toString("binary"),
+    btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    Promise,
+    Error,
+    Object, Array, String, Number, Boolean, Math, JSON, Date,
+    Map, Set, WeakMap, Symbol, Proxy, Reflect,
+    document: {
+      createElement: () => ({ style: {}, setAttribute() {}, appendChild() {}, remove() {} }),
+      head: { appendChild() {} },
+      body: { appendChild() {} },
+      querySelector: () => null,
+      addEventListener() {}
+    },
+    navigator: { userAgent: "Node" },
+    location: { href: "https://coursatk.online/" },
+    HTMLElement: class {},
+    HTMLVideoElement: class {},
+    MediaSource: class {},
+    URL: { createObjectURL: () => "blob:x", revokeObjectURL() {} },
+    Blob: class { constructor(p) { this.p = p; } },
+    fetch: async () => ({ ok: false }),
+    XMLHttpRequest: class { open() {} send() {} setRequestHeader() {} }
+  };
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.global = sandbox;
+
+  vm.runInNewContext(source, sandbox, { timeout: 8000 });
+
+  const du = sandbox.DecryptionUtils;
+  if (!du || typeof du.decryptPlaybackKey !== "function") {
+    throw new Error("DecryptionUtils.decryptPlaybackKey not found in player.js");
+  }
+
+  // Bind so `this` is correct if the method uses it
+  decryptPlaybackKey = du.decryptPlaybackKey.bind(du);
+  console.log("[Coursatk] DecryptionUtils ready (server-side key unwrap)");
+}
+
+async function unwrapKey(wrappedBuf, videoId) {
+  if (!decryptPlaybackKey) throw new Error("crypto not loaded");
+  const wrapped = wrappedBuf instanceof Uint8Array ? wrappedBuf : new Uint8Array(wrappedBuf);
+
+  // Already plain AES-128
+  if (wrapped.byteLength === 16) {
+    return Buffer.from(wrapped);
+  }
+
+  const result = await decryptPlaybackKey(wrapped, String(videoId));
+  const key = result?.key;
+  if (!key) throw new Error("decryptPlaybackKey returned empty key");
+
+  const aes = key instanceof ArrayBuffer
+    ? Buffer.from(key)
+    : Buffer.from(key.buffer || key, key.byteOffset || 0, key.byteLength || key.length);
+
+  if (aes.length !== 16) {
+    throw new Error(`AES key length ${aes.length} (expected 16)`);
+  }
+  return aes;
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
 const sessions = new Map();
 
 function authHeaders(extra = {}) {
@@ -48,19 +166,12 @@ function allowedStreamUrl(raw, session = null) {
   try {
     const u = new URL(raw);
     if (u.protocol !== "https:") return false;
-
-    // Allow the CDN hostname returned by the authenticated playback session.
-    // This avoids breaking when the stream provider rotates CDN hostnames.
     const sessionHosts = session?.allowedHosts || new Set();
-    const sessionHost = session?.streamUrl
-      ? new URL(session.streamUrl).hostname
-      : "";
-
+    const sessionHost = session?.streamUrl ? new URL(session.streamUrl).hostname : "";
     return STREAM_HOSTS.some(h =>
       u.hostname === h || u.hostname.endsWith("." + h)
     ) || (sessionHost && (
-      u.hostname === sessionHost ||
-      u.hostname.endsWith("." + sessionHost)
+      u.hostname === sessionHost || u.hostname.endsWith("." + sessionHost)
     )) || [...sessionHosts].some(h =>
       u.hostname === h || u.hostname.endsWith("." + h)
     );
@@ -84,9 +195,7 @@ async function upstreamJson(path, options = {}) {
   try { data = JSON.parse(text); } catch {
     throw new Error(`Upstream returned non-JSON (${r.status})`);
   }
-  if (!r.ok) {
-    throw new Error(data?.message || `Upstream HTTP ${r.status}`);
-  }
+  if (!r.ok) throw new Error(data?.message || `Upstream HTTP ${r.status}`);
   return data;
 }
 
@@ -98,7 +207,7 @@ function newSession(data) {
     token: data.token,
     streamUrl: data.stream_url,
     createdAt: Date.now(),
-    wrappedKey: null,
+    plainKey: null,       // decrypted 16-byte AES key
     keyUrl: null,
     variantUrl: null,
     allowedHosts: new Set([new URL(data.stream_url).hostname])
@@ -129,22 +238,13 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     Origin: STREAM_ORIGIN,
     Referer: STREAM_REFERER,
     "X-Requested-With": STREAM_X_REQUESTED_WITH,
-    // Prefer the real browser/WebView UA that reached Railway; otherwise use
-    // the optional Railway override. Never send Node/undici's default UA.
     "User-Agent": ch["user-agent"] || STREAM_USER_AGENT ||
       "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/153.0.0.0 Mobile Safari/537.36"
   };
 
-  // Forward the client hints/fetch metadata present on the original player
-  // request when available. These are optional but some CDNs validate them.
   for (const name of [
-    "sec-ch-ua-platform",
-    "sec-ch-ua",
-    "sec-ch-ua-mobile",
-    "sec-fetch-site",
-    "sec-fetch-mode",
-    "sec-fetch-dest",
-    "accept-language"
+    "sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile",
+    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "accept-language"
   ]) {
     if (ch[name]) headers[name] = ch[name];
   }
@@ -159,7 +259,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
 // ---------------- API mirror ----------------
 
 app.get("/api/config", (_req, res) => {
-  res.json({ success: true, yearId: YEAR_ID });
+  res.json({ success: true, yearId: YEAR_ID, cryptoReady: Boolean(decryptPlaybackKey) });
 });
 
 app.get("/api/subjects", async (_req, res) => {
@@ -167,7 +267,6 @@ app.get("/api/subjects", async (_req, res) => {
   catch (e) { jsonError(res, 502, e.message); }
 });
 
-// Accept the frontend's year-specific route too: /api/subjects/4
 app.get("/api/subjects/:id", async (req, res) => {
   try {
     const id = encodeURIComponent(req.params.id);
@@ -223,34 +322,28 @@ app.post("/api/play/:videoId", async (req, res) => {
 });
 
 // ---------------- Legacy API aliases ----------------
-// Keep the old frontend paths working too, so an older cached page does not
-// suddenly receive the HTML fallback instead of JSON.
 app.get("/user/subjects/:id", async (req, res) => {
   try { res.json(await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}`)); }
   catch (e) { jsonError(res, 502, e.message); }
 });
-
 app.get("/user/subjects/:id/teachers", async (req, res) => {
   try { res.json(await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}/teachers`)); }
   catch (e) { jsonError(res, 502, e.message); }
 });
-
 app.get("/user/teachers/:id/chapters", async (req, res) => {
   try { res.json(await upstreamJson(`/user/teachers/${encodeURIComponent(req.params.id)}/chapters`)); }
   catch (e) { jsonError(res, 502, e.message); }
 });
-
 app.get("/user/chapters/:id/lectures", async (req, res) => {
   try { res.json(await upstreamJson(`/user/chapters/${encodeURIComponent(req.params.id)}/lectures`)); }
   catch (e) { jsonError(res, 502, e.message); }
 });
-
 app.get("/user/lectures/:id/content", async (req, res) => {
   try { res.json(await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`)); }
   catch (e) { jsonError(res, 502, e.message); }
 });
 
-// ---------------- HLS proxy ----------------
+// ---------------- HLS proxy (key unwrapped server-side) ----------------
 
 app.get("/api/stream/manifest/:sessionId", async (req, res) => {
   const session = getSession(req.params.sessionId);
@@ -279,13 +372,13 @@ app.get("/api/stream/manifest/:sessionId", async (req, res) => {
       if (!variantRes.ok) throw new Error(`Variant HTTP ${variantRes.status}`);
       const variantText = await variantRes.text();
       session.variantUrl = variant;
-
       return rewritePlaylist(req.params.sessionId, session, variantText, variant, res, req.headers);
     }
 
     session.variantUrl = session.streamUrl;
     return rewritePlaylist(req.params.sessionId, session, masterText, session.streamUrl, res, req.headers);
   } catch (e) {
+    console.error("[manifest]", e.message);
     jsonError(res, 502, e.message);
   }
 });
@@ -303,10 +396,17 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
       if (uri) {
         session.keyUrl = absoluteUrl(uri, baseUrl);
         try { session.allowedHosts.add(new URL(session.keyUrl).hostname); } catch {}
+
+        // Fetch wrapped key + decrypt with the same video_id the userscript uses
         const keyRes = await streamFetch(session, session.keyUrl, {}, clientHeaders);
         if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
-        session.wrappedKey = Buffer.from(await keyRes.arrayBuffer());
+        const wrapped = Buffer.from(await keyRes.arrayBuffer());
 
+        console.log(`[key] wrapped ${wrapped.length} bytes, videoId=${session.videoId}`);
+        session.plainKey = await unwrapKey(wrapped, session.videoId);
+        console.log(`[key] unwrapped AES-128 (${session.plainKey.length} bytes)`);
+
+        // Point playlist at our endpoint that serves the *plain* key
         const rewritten = line.replace(
           /URI="[^"]+"/,
           `URI="/api/stream/key/${sessionId}"`
@@ -318,12 +418,7 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
 
     if (line && !line.startsWith("#")) {
       const segmentUrl = absoluteUrl(line, baseUrl);
-
-      // IMPORTANT: the original player can receive segments from a CDN host
-      // different from the master/variant host. Register that exact host in
-      // the current playback session before the browser requests the proxy URL.
       try { session.allowedHosts.add(new URL(segmentUrl).hostname); } catch {}
-
       const encoded = Buffer.from(segmentUrl, "utf8").toString("base64url");
       out.push(`/api/stream/segment/${sessionId}/${encoded}`);
       continue;
@@ -340,16 +435,18 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
   res.send(out.join("\n"));
 }
 
+// Serve the *plain* 16-byte AES key (already decrypted server-side)
 app.get("/api/stream/key/:sessionId", (req, res) => {
   const session = getSession(req.params.sessionId);
-  if (!session?.wrappedKey) return jsonError(res, 404, "مفتاح التشغيل غير متاح");
+  if (!session?.plainKey) return jsonError(res, 404, "مفتاح التشغيل غير متاح");
 
   res.set({
     "Content-Type": "application/octet-stream",
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*"
+    "Access-Control-Allow-Origin": "*",
+    "Content-Length": String(session.plainKey.length)
   });
-  res.send(session.wrappedKey);
+  res.send(session.plainKey);
 });
 
 app.get("/api/stream/segment/:sessionId/:encodedUrl", async (req, res) => {
@@ -415,13 +512,14 @@ app.get("/api/stream/segment/:sessionId/:encodedUrl", async (req, res) => {
   }
 });
 
-// ---------------- Health/static ----------------
+// ---------------- Health ----------------
 
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "coursatk-railway-server",
     tokenConfigured: Boolean(AUTH_TOKEN),
+    cryptoReady: Boolean(decryptPlaybackKey),
     sessions: sessions.size,
     now: new Date().toISOString()
   });
@@ -434,23 +532,457 @@ setInterval(() => {
   }
 }, 60_000).unref();
 
-// ---------------- Embedded frontend ----------------
-const INDEX_HTML = "<!doctype html>\n<html lang=\"ar\" dir=\"rtl\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">\n<title>Coursatk</title>\n</head>\n<body>\n<div id=\"coursatk-server-page\">\n  <div class=\"server-hero\">\n    <div class=\"server-hero-card\">\n      <div class=\"server-hero-title\">Coursatk</div>\n      <div class=\"server-hero-sub\">نفس لوحة السكربت — التشغيل من السيرفر عند الضغط على تشغيل فقط</div>\n      <div class=\"server-hero-badge\">HLS • Railway • Watch History</div>\n      <br>\n      <button class=\"server-open\" id=\"server-open\">فتح لوحة كورساتك</button>\n    </div>\n  </div>\n</div>\n<script>\n    // =========================================================\n    // CONFIG\n    // =========================================================\n    const CONFIG = {\n        MAX_SEGMENT_BYTES: 2 * 1024 * 1024,\n        MAX_RETRIES: 3,\n        TIMEOUT: 45000,\n        API_BASE: '',\n        YEAR_ID: 4\n\n    };\n\n    const PLAYER_JS = \"https://player.stream-weave.com/assets/player.js?v=1.1.1\";\n    let cryptoInstance = null;\n\n    // =========================================================\n    // STATE\n    // =========================================================\n    const STATE = {\n        view: 'subjects',\n        stack: [],\n        cache: {},\n        ui: { visible: false },\n        download: null,\n        player: null\n    };\n\n    // =========================================================\n    // STYLES\n    // =========================================================\n    function injectStyles() {\n        if (document.getElementById('sw-styles')) return;\n        const style = document.createElement('style');\n        style.id = 'sw-styles';\n        style.textContent = `\n\n            html, body { margin:0; min-height:100%; background:#050505; color:#fff; font-family:'Cairo',system-ui,sans-serif; }\n            body { min-height:100vh; overflow-x:hidden; }\n            #coursatk-server-page { min-height:100vh; background:radial-gradient(circle at top,#171717,#050505 42%); }\n            #coursatk-server-page .server-hero { padding:28px 18px 20px; max-width:1100px; margin:auto; }\n            #coursatk-server-page .server-hero-card { border:1px solid rgba(255,255,255,.08); border-radius:22px; background:linear-gradient(145deg,#151515,#0a0a0a); padding:18px; box-shadow:0 18px 55px rgba(0,0,0,.4); }\n            #coursatk-server-page .server-hero-title { font-size:20px; font-weight:800; }\n            #coursatk-server-page .server-hero-sub { margin-top:4px; color:#888; font-size:11px; }\n            #coursatk-server-page .server-hero-badge { display:inline-flex; margin-top:12px; padding:6px 10px; border-radius:999px; background:rgba(76,175,80,.12); color:#74e0a1; font-size:10px; }\n            #coursatk-server-page .server-open { margin-top:12px; border:0; border-radius:12px; padding:10px 14px; background:linear-gradient(135deg,#4CAF50,#388E3C); color:#fff; font:700 12px Cairo; cursor:pointer; }\n            #sw-panel .sw-content { overflow-y:auto; }\n            #sw-player-overlay { position:fixed; inset:0; z-index:1000001; background:#000; display:flex; align-items:center; justify-content:center; }\n            @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap');\n\n            #sw-panel, #sw-panel * {\n                box-sizing: border-box;\n                font-family: 'Cairo', system-ui, -apple-system, sans-serif;\n                -webkit-tap-highlight-color: transparent;\n            }\n\n            #sw-panel {\n                position: fixed;\n                left: 0; right: 0; bottom: 0;\n                z-index: 999999;\n                background: linear-gradient(180deg, rgba(20,22,28,0.98) 0%, rgba(12,14,18,0.99) 100%);\n                backdrop-filter: blur(24px) saturate(180%);\n                -webkit-backdrop-filter: blur(24px) saturate(180%);\n                border-top-left-radius: 24px;\n                border-top-right-radius: 24px;\n                border-top: 1px solid rgba(255,255,255,0.08);\n                color: #fff;\n                box-shadow: 0 -20px 60px rgba(0,0,0,0.9);\n                transform: translateY(105%);\n                transition: transform 0.42s cubic-bezier(0.32, 0.72, 0, 1);\n                max-height: 88vh;\n                display: flex;\n                flex-direction: column;\n                overflow: hidden;\n                will-change: transform;\n            }\n\n            #sw-panel.sw-open { transform: translateY(0); }\n            #sw-panel.sw-dragging { transition: none; }\n\n            .sw-handle {\n                width: 100%;\n                padding: 10px 0 6px;\n                display: flex;\n                justify-content: center;\n                flex-shrink: 0;\n                cursor: grab;\n                touch-action: none;\n            }\n            .sw-handle::before {\n                content: '';\n                width: 42px; height: 4px;\n                border-radius: 4px;\n                background: rgba(255,255,255,0.18);\n                transition: background 0.2s;\n            }\n            .sw-handle:active::before { background: rgba(255,255,255,0.35); }\n\n            .sw-header {\n                display: flex; align-items: center; gap: 10px;\n                padding: 4px 16px 12px; flex-shrink: 0;\n            }\n            .sw-icon-btn {\n                width: 38px; height: 38px;\n                border: none; border-radius: 12px;\n                background: rgba(255,255,255,0.06);\n                color: #ccc; font-size: 16px; cursor: pointer;\n                display: flex; align-items: center; justify-content: center;\n                transition: all 0.2s; flex-shrink: 0;\n                position: relative; z-index: 10;\n            }\n            .sw-icon-btn:hover { background: rgba(255,255,255,0.12); color: #fff; }\n            .sw-icon-btn:active { transform: scale(0.94); }\n            .sw-icon-btn.sw-hidden { display: none; }\n\n            .sw-brand { flex: 1; min-width: 0; }\n            .sw-brand h3 {\n                margin: 0; font-size: 15px; font-weight: 700;\n                color: #fff; letter-spacing: -0.2px;\n            }\n            .sw-brand p {\n                margin: 1px 0 0; font-size: 10px;\n                color: #6b7280; font-weight: 500;\n            }\n\n            .sw-close {\n                background: rgba(255,255,255,0.06);\n                border: none; color: #999;\n                width: 38px; height: 38px;\n                border-radius: 12px; font-size: 16px;\n                cursor: pointer; transition: all 0.2s; flex-shrink: 0;\n                position: relative; z-index: 10;\n            }\n            .sw-close:hover { background: rgba(244,67,54,0.15); color: #f44336; }\n            .sw-close:active { transform: scale(0.94); }\n\n            .sw-breadcrumb {\n                display: flex; align-items: center; gap: 6px;\n                padding: 0 16px 12px; font-size: 11px;\n                color: #6b7280; overflow-x: auto;\n                scrollbar-width: none; flex-shrink: 0;\n            }\n            .sw-breadcrumb::-webkit-scrollbar { display: none; }\n            .sw-breadcrumb span {\n                white-space: nowrap; padding: 3px 8px;\n                border-radius: 6px; transition: all 0.2s;\n            }\n            .sw-breadcrumb span.sw-crumb-link {\n                cursor: pointer; color: #9ca3af;\n                background: rgba(255,255,255,0.04);\n            }\n            .sw-breadcrumb span.sw-crumb-link:hover {\n                color: #4CAF50; background: rgba(76,175,80,0.12);\n            }\n            .sw-breadcrumb span.sw-crumb-current {\n                color: #4CAF50; font-weight: 600;\n            }\n            .sw-breadcrumb .sw-sep { color: #374151; padding: 0; }\n\n            .sw-content {\n                flex: 1; overflow-y: auto; overflow-x: hidden;\n                padding: 0 12px 16px;\n                -webkit-overflow-scrolling: touch;\n                overscroll-behavior: contain;\n                scrollbar-width: thin;\n                scrollbar-color: rgba(255,255,255,0.1) transparent;\n                min-height: 120px;\n            }\n            .sw-content::-webkit-scrollbar { width: 4px; }\n            .sw-content::-webkit-scrollbar-thumb {\n                background: rgba(255,255,255,0.1); border-radius: 4px;\n            }\n\n            .sw-section {\n                display: flex; align-items: center; gap: 8px;\n                padding: 14px 6px 8px; font-size: 12px;\n                font-weight: 600; color: #6b7280;\n                text-transform: uppercase; letter-spacing: 0.5px;\n            }\n            .sw-section::after {\n                content: ''; flex: 1; height: 1px;\n                background: linear-gradient(90deg, rgba(255,255,255,0.08), transparent);\n            }\n\n            .sw-card {\n                display: flex; align-items: center; gap: 12px;\n                padding: 14px; margin-bottom: 8px;\n                background: rgba(255,255,255,0.035);\n                border: 1px solid rgba(255,255,255,0.05);\n                border-radius: 14px; cursor: pointer;\n                transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);\n                position: relative; overflow: hidden;\n                animation: swFadeIn 0.3s ease both;\n            }\n            @keyframes swFadeIn {\n                from { opacity: 0; transform: translateY(6px); }\n                to { opacity: 1; transform: translateY(0); }\n            }\n            .sw-card:active { transform: scale(0.985); }\n            .sw-card:hover {\n                background: rgba(255,255,255,0.06);\n                border-color: rgba(255,255,255,0.1);\n            }\n            .sw-card.sw-card-accent::before {\n                content: ''; position: absolute;\n                left: 0; top: 0; bottom: 0; width: 3px;\n                background: linear-gradient(180deg, #4CAF50, #2E7D32);\n            }\n\n            .sw-card-icon {\n                width: 40px; height: 40px; border-radius: 11px;\n                background: linear-gradient(135deg, rgba(76,175,80,0.18), rgba(76,175,80,0.06));\n                display: flex; align-items: center; justify-content: center;\n                font-size: 18px; flex-shrink: 0;\n                border: 1px solid rgba(76,175,80,0.15);\n            }\n\n            .sw-card-body { flex: 1; min-width: 0; }\n            .sw-card-title {\n                font-size: 14px; font-weight: 600;\n                color: #e5e7eb; line-height: 1.35;\n                overflow: hidden; text-overflow: ellipsis;\n                display: -webkit-box; -webkit-line-clamp: 2;\n                -webkit-box-orient: vertical;\n            }\n            .sw-card-sub {\n                font-size: 11px; color: #6b7280;\n                margin-top: 3px; display: flex;\n                align-items: center; gap: 8px; flex-wrap: wrap;\n            }\n            .sw-chip {\n                display: inline-flex; align-items: center; gap: 3px;\n                padding: 2px 7px; background: rgba(255,255,255,0.06);\n                border-radius: 6px; font-size: 10px;\n                font-weight: 500; color: #9ca3af;\n            }\n            .sw-chip.sw-chip-green { background: rgba(76,175,80,0.15); color: #4CAF50; }\n            .sw-chip.sw-chip-blue { background: rgba(33,150,243,0.15); color: #64b5f6; }\n            .sw-chip.sw-chip-orange { background: rgba(255,152,0,0.15); color: #FFB74D; }\n            .sw-chip.sw-chip-purple { background: rgba(156,39,176,0.15); color: #ce93d8; }\n\n            .sw-chevron {\n                color: #4b5563; font-size: 16px;\n                flex-shrink: 0; transition: transform 0.2s;\n            }\n            .sw-card:hover .sw-chevron { color: #4CAF50; transform: translateX(-2px); }\n\n            .sw-btn {\n                padding: 8px 14px; border: none; border-radius: 10px;\n                font-weight: 600; font-size: 12px; cursor: pointer;\n                transition: all 0.2s; flex-shrink: 0;\n                display: inline-flex; align-items: center;\n                justify-content: center; gap: 5px; font-family: inherit;\n                position: relative; z-index: 5;\n            }\n            .sw-btn:active { transform: scale(0.95); }\n            .sw-btn-primary {\n                background: linear-gradient(135deg, #4CAF50, #388E3C);\n                color: #fff;\n                box-shadow: 0 2px 10px rgba(76,175,80,0.3);\n            }\n            .sw-btn-primary:hover { box-shadow: 0 4px 16px rgba(76,175,80,0.5); }\n            .sw-btn-secondary {\n                background: rgba(255,255,255,0.08); color: #d1d5db;\n            }\n            .sw-btn-secondary:hover { background: rgba(255,255,255,0.14); }\n            .sw-btn-warn {\n                background: linear-gradient(135deg, #FF9800, #F57C00);\n                color: #fff;\n            }\n            .sw-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }\n\n            .sw-skeleton {\n                background: linear-gradient(90deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.08) 50%, rgba(255,255,255,0.04) 100%);\n                background-size: 200% 100%;\n                animation: swShimmer 1.4s infinite;\n                border-radius: 14px; height: 68px; margin-bottom: 8px;\n            }\n            @keyframes swShimmer {\n                0% { background-position: 200% 0; }\n                100% { background-position: -200% 0; }\n            }\n\n            .sw-state {\n                display: flex; flex-direction: column;\n                align-items: center; justify-content: center;\n                padding: 48px 24px; text-align: center;\n                color: #6b7280; gap: 12px;\n                animation: swFadeIn 0.3s ease;\n            }\n            .sw-state-icon { font-size: 42px; opacity: 0.6; margin-bottom: 4px; }\n            .sw-state-title { font-size: 15px; font-weight: 600; color: #9ca3af; }\n            .sw-state-desc {\n                font-size: 12px; color: #6b7280;\n                max-width: 260px; line-height: 1.5;\n                word-break: break-word;\n            }\n            .sw-state .sw-btn { margin-top: 8px; }\n\n            .sw-spinner {\n                width: 18px; height: 18px;\n                border: 2px solid rgba(255,255,255,0.15);\n                border-top-color: #4CAF50;\n                border-radius: 50%;\n                animation: swSpin 0.7s linear infinite;\n            }\n            @keyframes swSpin { to { transform: rotate(360deg); } }\n\n            .sw-footer {\n                padding: 12px 16px 18px;\n                background: rgba(0,0,0,0.4);\n                border-top: 1px solid rgba(255,255,255,0.05);\n                flex-shrink: 0; transition: all 0.3s;\n            }\n            .sw-footer.sw-hidden { display: none; }\n\n            .sw-progress-head {\n                display: flex; justify-content: space-between;\n                align-items: center; margin-bottom: 8px; gap: 8px;\n            }\n            .sw-progress-label {\n                font-size: 12px; color: #9ca3af;\n                font-weight: 500; overflow: hidden;\n                text-overflow: ellipsis; white-space: nowrap; flex: 1;\n            }\n            .sw-progress-percent {\n                font-size: 14px; font-weight: 700; color: #4CAF50;\n                font-variant-numeric: tabular-nums;\n            }\n\n            .sw-progress-track {\n                width: 100%; height: 6px;\n                background: rgba(255,255,255,0.06);\n                border-radius: 4px; overflow: hidden; position: relative;\n            }\n            .sw-progress-fill {\n                height: 100%;\n                background: linear-gradient(90deg, #4CAF50, #8BC34A);\n                border-radius: 4px;\n                transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);\n                box-shadow: 0 0 12px rgba(76,175,80,0.5);\n                position: relative;\n            }\n            .sw-progress-fill::after {\n                content: ''; position: absolute; inset: 0;\n                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);\n                animation: swProgressShine 1.8s infinite;\n            }\n            @keyframes swProgressShine {\n                0% { transform: translateX(-100%); }\n                100% { transform: translateX(100%); }\n            }\n            .sw-progress-fill.sw-paused {\n                background: linear-gradient(90deg, #FF9800, #F57C00);\n                box-shadow: 0 0 12px rgba(255,152,0,0.5);\n            }\n            .sw-progress-fill.sw-paused::after { animation: none; }\n\n            .sw-progress-meta {\n                display: flex; justify-content: space-between;\n                margin-top: 6px; font-size: 10px;\n                color: #6b7280; font-variant-numeric: tabular-nums;\n            }\n\n            .sw-progress-actions { display: flex; gap: 8px; margin-top: 10px; }\n            .sw-progress-actions .sw-btn { flex: 1; justify-content: center; padding: 9px; }\n\n            #sw-toggle {\n                position: fixed; bottom: 20px; right: 20px;\n                z-index: 999998; width: 62px; height: 62px;\n                border-radius: 50%; border: none;\n                background: linear-gradient(135deg, #4CAF50, #2E7D32);\n                color: #fff; font-size: 26px; cursor: pointer;\n                box-shadow: 0 8px 28px rgba(76,175,80,0.45), 0 0 0 0 rgba(76,175,80,0.5);\n                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);\n                display: flex; align-items: center; justify-content: center;\n                animation: swPulse 2.5s infinite;\n            }\n            @keyframes swPulse {\n                0% { box-shadow: 0 8px 28px rgba(76,175,80,0.45), 0 0 0 0 rgba(76,175,80,0.5); }\n                70% { box-shadow: 0 8px 28px rgba(76,175,80,0.45), 0 0 0 14px rgba(76,175,80,0); }\n                100% { box-shadow: 0 8px 28px rgba(76,175,80,0.45), 0 0 0 0 rgba(76,175,80,0); }\n            }\n            #sw-toggle:active { transform: scale(0.9); }\n            #sw-toggle.sw-active {\n                background: linear-gradient(135deg, #f44336, #c62828);\n                animation: none;\n            }\n            #sw-toggle.sw-has-download::after {\n                content: '';\n                position: absolute;\n                top: 4px; right: 4px;\n                width: 12px; height: 12px;\n                background: #FF9800;\n                border-radius: 50%;\n                border: 2px solid rgba(20,22,28,0.98);\n                animation: swDotPulse 1.5s infinite;\n            }\n            @keyframes swDotPulse {\n                0%, 100% { transform: scale(1); }\n                50% { transform: scale(1.3); }\n            }\n\n\n            /* ================= PLAYER v6 ================= */\n            #sw-player-overlay {\n                position: fixed;\n                inset: 0;\n                z-index: 1000001;\n                background: #000;\n                display: flex;\n                align-items: center;\n                justify-content: center;\n                padding: 0;\n                font-family: 'Cairo', system-ui, sans-serif;\n            }\n\n            .sw-player-shell {\n                width: 100%;\n                max-width: 1200px;\n                height: 100%;\n                max-height: 100vh;\n                display: flex;\n                flex-direction: column;\n                background: #000;\n                overflow: hidden;\n            }\n\n            .sw-player-head {\n                min-height: 54px;\n                display: flex;\n                align-items: center;\n                gap: 10px;\n                padding: 8px 12px;\n                background: #070707;\n                color: #fff;\n                flex-shrink: 0;\n            }\n\n            .sw-player-title {\n                flex: 1;\n                min-width: 0;\n                font-size: 14px;\n                font-weight: 700;\n                white-space: nowrap;\n                overflow: hidden;\n                text-overflow: ellipsis;\n            }\n\n            .sw-player-close {\n                width: 40px;\n                height: 40px;\n                border: 0;\n                border-radius: 12px;\n                background: #181818;\n                color: #fff;\n                cursor: pointer;\n                font-size: 17px;\n            }\n\n            .sw-video-wrap {\n                position: relative;\n                width: 100%;\n                flex: 1;\n                min-height: 0;\n                background: #000;\n                display: flex;\n                align-items: center;\n                justify-content: center;\n            }\n\n            .sw-video {\n                width: 100%;\n                height: 100%;\n                display: block;\n                background: #000 !important;\n                object-fit: contain;\n            }\n\n            .sw-player-start {\n                position: absolute;\n                inset: 0;\n                z-index: 4;\n                display: flex;\n                flex-direction: column;\n                align-items: center;\n                justify-content: center;\n                gap: 15px;\n                background: #000;\n            }\n\n            .sw-big-play {\n                width: 92px;\n                height: 92px;\n                border: 0;\n                border-radius: 50%;\n                background: rgba(255,255,255,.12);\n                color: #fff;\n                box-shadow: 0 0 0 1px rgba(255,255,255,.14);\n                font-size: 39px;\n                cursor: pointer;\n                display: grid;\n                place-items: center;\n                padding-left: 7px;\n            }\n\n            .sw-big-play:active {\n                transform: scale(.94);\n            }\n\n            .sw-start-text {\n                color: #aaa;\n                font-size: 12px;\n            }\n\n            .sw-player-loading {\n                position: absolute;\n                inset: 0;\n                z-index: 5;\n                display: none;\n                flex-direction: column;\n                align-items: center;\n                justify-content: center;\n                gap: 12px;\n                background: rgba(0,0,0,.88);\n                color: #fff;\n                pointer-events: none;\n            }\n\n            .sw-player-loading-text {\n                font-size: 12px;\n                color: #ddd;\n            }\n\n            .sw-spinner {\n                width: 34px;\n                height: 34px;\n                border: 3px solid rgba(255,255,255,.18);\n                border-top-color: #fff;\n                border-radius: 50%;\n                animation: swSpin .8s linear infinite;\n            }\n\n            @keyframes swSpin {\n                to { transform: rotate(360deg); }\n            }\n\n            .sw-player-error {\n                display: none;\n                position: absolute;\n                z-index: 8;\n                left: 12px;\n                right: 12px;\n                bottom: 12px;\n                padding: 11px 13px;\n                border-radius: 10px;\n                background: rgba(125, 18, 18, .95);\n                color: #fff;\n                font-size: 12px;\n                line-height: 1.6;\n            }\n\n            .sw-player-info {\n                min-height: 42px;\n                display: flex;\n                align-items: center;\n                justify-content: space-between;\n                gap: 8px;\n                padding: 8px 12px;\n                background: #070707;\n                color: #999;\n                font-size: 10px;\n                flex-shrink: 0;\n            }\n\n            .sw-player-time {\n                color: #fff;\n                direction: ltr;\n                font-variant-numeric: tabular-nums;\n            }\n\n            .sw-player-progress {\n                color: #fff;\n                font-variant-numeric: tabular-nums;\n            }\n\n            .sw-pdf-hidden {\n                display: none !important;\n            }\n\n            @media (min-width: 700px) {\n                .sw-player-shell {\n                    height: auto;\n                    max-height: 96vh;\n                    border-radius: 16px;\n                    box-shadow: 0 24px 80px rgba(0,0,0,.9);\n                }\n\n                .sw-video-wrap {\n                    aspect-ratio: 16 / 9;\n                    flex: 0 1 auto;\n                }\n            }\n\n            .sw-toast {\n                position: fixed; top: 20px; left: 50%;\n                transform: translateX(-50%) translateY(-100px);\n                background: rgba(18,20,26,0.98);\n                backdrop-filter: blur(20px); color: #fff;\n                padding: 14px 18px; border-radius: 14px;\n                font-size: 13px; font-weight: 500;\n                z-index: 1000000; max-width: 90vw;\n                display: flex; align-items: center; gap: 10px;\n                border: 1px solid rgba(255,255,255,0.08);\n                box-shadow: 0 20px 60px rgba(0,0,0,0.7);\n                transition: transform 0.4s cubic-bezier(0.32, 0.72, 0, 1);\n                font-family: 'Cairo', system-ui, sans-serif;\n                pointer-events: none;\n            }\n            .sw-toast.sw-show { transform: translateX(-50%) translateY(0); }\n            .sw-toast-icon {\n                width: 32px; height: 32px; border-radius: 10px;\n                display: flex; align-items: center; justify-content: center;\n                font-size: 16px; flex-shrink: 0;\n            }\n            .sw-toast.sw-success .sw-toast-icon { background: rgba(76,175,80,0.2); }\n            .sw-toast.sw-error .sw-toast-icon { background: rgba(244,67,54,0.2); }\n            .sw-toast.sw-info .sw-toast-icon { background: rgba(33,150,243,0.2); }\n            .sw-toast.sw-warning .sw-toast-icon { background: rgba(255,152,0,0.2); }\n        `;\n        document.head.appendChild(style);\n    }\n\n    // =========================================================\n    // HELPERS\n    // =========================================================\n    const $ = (id) => document.getElementById(id);\n    const el = (tag, cls, text) => {\n        const e = document.createElement(tag);\n        if (cls) e.className = cls;\n        if (text != null) e.textContent = text;\n        return e;\n    };\n\n    function getToken() { return ''; }\n\n    async function apiGet(path) {\n        const res = await fetch(path, {\n            headers: { 'Accept': 'application/json' },\n            credentials: 'same-origin',\n            cache: 'no-store'\n        });\n        let data;\n        try { data = await res.json(); } catch { throw new Error(`رد غير صالح من السيرفر (HTTP ${res.status})`); }\n        if (!res.ok) throw new Error(data?.message || `HTTP ${res.status}`);\n        return data;\n    }\n\n    function formatSize(bytes) {\n        if (!bytes) return '0 MB';\n        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';\n        return (bytes / 1024 / 1024).toFixed(2) + ' MB';\n    }\n\n    function formatDuration(seconds) {\n        if (!seconds) return '';\n        const h = Math.floor(seconds / 3600);\n        const m = Math.floor((seconds % 3600) / 60);\n        const s = seconds % 60;\n        if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;\n        return `${m}:${String(s).padStart(2, '0')}`;\n    }\n\n    function haptic(ms = 8) {\n        if (navigator.vibrate) {\n            try { navigator.vibrate(ms); } catch {}\n        }\n    }\n\n    // =========================================================\n    // TOAST\n    // =========================================================\n    let toastTimeout = null;\n    let currentToast = null;\n\n    function showToast(msg, type = 'info', duration = 3500) {\n        try {\n            if (currentToast) currentToast.remove();\n        } catch {}\n        if (toastTimeout) clearTimeout(toastTimeout);\n\n        const icons = { success: '✓', error: '✕', info: 'ℹ', warning: '⚠' };\n        const t = el('div', `sw-toast sw-${type}`);\n        t.innerHTML = `\n            <div class=\"sw-toast-icon\">${icons[type] || 'ℹ'}</div>\n            <div>${msg}</div>\n        `;\n        document.body.appendChild(t);\n        currentToast = t;\n\n        requestAnimationFrame(() => {\n            requestAnimationFrame(() => t.classList.add('sw-show'));\n        });\n\n        toastTimeout = setTimeout(() => {\n            t.classList.remove('sw-show');\n            setTimeout(() => {\n                try { t.remove(); } catch {}\n                if (currentToast === t) currentToast = null;\n            }, 400);\n        }, duration);\n    }\n\n    // =========================================================\n    // INDEXEDDB\n    // =========================================================\n    const DB_NAME = 'coursatk_dl';\n    const DB_VERSION = 2;  // ✅ زودنا الإصدار\n    const STORE_SEGMENTS = 'segments';\n    const STORE_DOWNLOADS = 'downloads';   // ✅ جديد: لحفظ الـ manifest\n\n    function openDB() {\n        return new Promise((resolve, reject) => {\n            try {\n                const req = indexedDB.open(DB_NAME, DB_VERSION);\n                req.onupgradeneeded = e => {\n                    const db = e.target.result;\n                    if (!db.objectStoreNames.contains(STORE_SEGMENTS)) {\n                        db.createObjectStore(STORE_SEGMENTS, { keyPath: 'key' });\n                    }\n                    if (!db.objectStoreNames.contains(STORE_DOWNLOADS)) {\n                        db.createObjectStore(STORE_DOWNLOADS, { keyPath: 'key' });\n                    }\n                };\n                req.onsuccess = () => resolve(req.result);\n                req.onerror = () => reject(req.error);\n            } catch (e) {\n                reject(e);\n            }\n        });\n    }\n\n    async function dbPut(store, key, value) {\n        try {\n            const db = await openDB();\n            return new Promise((resolve, reject) => {\n                const tx = db.transaction(store, 'readwrite');\n                tx.objectStore(store).put({ key, value, ts: Date.now() });\n                tx.oncomplete = () => resolve();\n                tx.onerror = () => reject(tx.error);\n            });\n        } catch (e) {\n            console.warn('[SW] dbPut failed', e);\n        }\n    }\n\n    async function dbGet(store, key) {\n        try {\n            const db = await openDB();\n            return new Promise((resolve, reject) => {\n                const tx = db.transaction(store, 'readonly');\n                const req = tx.objectStore(store).get(key);\n                req.onsuccess = () => resolve(req.result?.value);\n                req.onerror = () => reject(req.error);\n            });\n        } catch (e) {\n            return null;\n        }\n    }\n\n    async function dbDelete(store, key) {\n        try {\n            const db = await openDB();\n            return new Promise((resolve, reject) => {\n                const tx = db.transaction(store, 'readwrite');\n                tx.objectStore(store).delete(key);\n                tx.oncomplete = () => resolve();\n                tx.onerror = () => reject(tx.error);\n            });\n        } catch (e) {}\n    }\n\n    async function dbList(store) {\n        try {\n            const db = await openDB();\n            return new Promise((resolve, reject) => {\n                const tx = db.transaction(store, 'readonly');\n                const req = tx.objectStore(store).getAll();\n                req.onsuccess = () => resolve(req.result || []);\n                req.onerror = () => reject(req.error);\n            });\n        } catch (e) {\n            return [];\n        }\n    }\n\n    async function dbCleanOld() {\n        try {\n            const db = await openDB();\n            const cutoff = Date.now() - CONFIG.STALE_HOURS * 3600 * 1000;\n            for (const store of [STORE_SEGMENTS, STORE_DOWNLOADS]) {\n                await new Promise((resolve) => {\n                    const tx = db.transaction(store, 'readwrite');\n                    const req = tx.objectStore(store).openCursor();\n                    req.onsuccess = e => {\n                        const cursor = e.target.result;\n                        if (cursor) {\n                            if (cursor.value.ts < cutoff) cursor.delete();\n                            cursor.continue();\n                        }\n                    };\n                    tx.oncomplete = () => resolve();\n                });\n            }\n        } catch {}\n    }\n\n    // =========================================================\n    // CRYPTO\n    // =========================================================\n    function findCrypto() {\n        if (cryptoInstance) return cryptoInstance;\n        if (window.DecryptionUtils &&\n            typeof window.DecryptionUtils.decryptPlaybackKey === 'function' &&\n            typeof window.DecryptionUtils.decryptAES128WithIV === 'function') {\n            cryptoInstance = window.DecryptionUtils;\n            return cryptoInstance;\n        }\n        for (const key of Object.getOwnPropertyNames(window)) {\n            try {\n                const obj = window[key];\n                if (obj && typeof obj === 'object' &&\n                    typeof obj.decryptPlaybackKey === 'function' &&\n                    typeof obj.decryptAES128WithIV === 'function') {\n                    cryptoInstance = obj;\n                    return obj;\n                }\n            } catch {}\n        }\n        return null;\n    }\n\n    async function loadPlayer() {\n        let crypto = findCrypto();\n        if (crypto) return crypto;\n\n        await new Promise((resolve, reject) => {\n            const existing = document.querySelector('script[src*=\"player.stream-weave.com\"]');\n            if (existing) { setTimeout(resolve, 500); return; }\n            const script = document.createElement('script');\n            script.src = PLAYER_JS;\n            script.onload = resolve;\n            script.onerror = () => reject(new Error('فشل تحميل المشغل'));\n            document.head.appendChild(script);\n        });\n\n        for (let i = 0; i < 20; i++) {\n            crypto = findCrypto();\n            if (crypto) return crypto;\n            await new Promise(r => setTimeout(r, 150));\n        }\n        throw new Error('ما لقيتش أدوات التشفير');\n    }\n\n    async function getPlayback(videoId) {\n        const token = getToken();\n        if (!token) throw new Error('مش مسجل دخول');\n        const res = await fetch(`${CONFIG.API_BASE}/video/${videoId}/stream-weave/play`, {\n            method: 'POST',\n            headers: {\n                'Authorization': `Bearer ${token}`,\n                'Accept': 'application/json'\n            },\n            credentials: 'omit',\n            cache: 'no-store'\n        });\n        const data = await res.json();\n        if (!res.ok) throw new Error(data?.message || `HTTP ${res.status}`);\n        if (!data?.success || !data?.data?.token || !data?.data?.stream_url || !data?.data?.video_id) {\n            throw new Error('الرد ناقص');\n        }\n        return data.data;\n    }\n\n    async function fetchSegmentWithRetry(url, token, signal, retries = CONFIG.MAX_RETRIES) {\n        for (let i = 0; i < retries; i++) {\n            if (signal.aborted) throw new Error('ABORTED');\n            try {\n                const controller = new AbortController();\n                const onAbort = () => controller.abort();\n                signal.addEventListener('abort', onAbort, { once: true });\n                const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT);\n\n                const res = await fetch(url, {\n                    headers: { 'Authorization': `Bearer ${token}` },\n                    cache: 'no-store',\n                    signal: controller.signal\n                });\n                clearTimeout(timeoutId);\n                signal.removeEventListener('abort', onAbort);\n\n                if (!res.ok) throw new Error(`HTTP ${res.status}`);\n                return await res.arrayBuffer();\n            } catch (e) {\n                if (signal.aborted) throw new Error('ABORTED');\n                if (i === retries - 1) throw e;\n                await new Promise(r => setTimeout(r, 1000 * (i + 1)));\n            }\n        }\n    }\n\n    // =========================================================\n    // STREAM PLAYER ENGINE v6.0\n    // HLS.js + custom Stream-Weave key\n    // لا يوجد تنزيل كامل ولا IndexedDB للفيديو.\n    // يبدأ جلب الـplaylist/segments بعد ضغط Play فقط.\n    // =========================================================\n\n    const HISTORY_PREFIX = 'coursatk_watch_v6_';\n    const HLS_JS = 'https://cdn.jsdelivr.net/npm/hls.js@1.6.15/dist/hls.min.js';\n    const PLAYER_MAX_BUFFER_SECONDS = 18;\n    const PLAYER_MAX_BUFFER_BYTES = 2 * 1024 * 1024;\n\n    function historyKey(videoId) {\n        return HISTORY_PREFIX + String(videoId);\n    }\n\n    function getWatchState(videoId) {\n        try {\n            return JSON.parse(localStorage.getItem(historyKey(videoId)) || 'null');\n        } catch {\n            return null;\n        }\n    }\n\n    function saveWatchState(videoId, state) {\n        try {\n            localStorage.setItem(historyKey(videoId), JSON.stringify({\n                videoId: String(videoId),\n                currentTime: Number(state.currentTime || 0),\n                duration: Number(state.duration || 0),\n                percent: Number(state.percent || 0),\n                watched: !!state.watched,\n                updatedAt: Date.now()\n            }));\n        } catch {}\n    }\n\n    function destroyPlayer() {\n        const p = STATE.player;\n        if (!p) return;\n        p.destroyed = true;\n        try { p.abortController.abort(); } catch {}\n        try { p.hls?.stopLoad(); } catch {}\n        try { p.hls?.detachMedia(); } catch {}\n        try { p.hls?.destroy(); } catch {}\n        try { p.video?.pause(); } catch {}\n        try { p.video?.removeAttribute('src'); } catch {}\n        try { p.video?.load(); } catch {}\n        try { p.overlay?.remove(); } catch {}\n        STATE.player = null;\n    }\n\n    function loadHlsJS() {\n        if (window.Hls) return Promise.resolve(window.Hls);\n        return new Promise((resolve, reject) => {\n            const existing = document.querySelector('script[data-coursatk-hls]');\n            if (existing) {\n                let tries = 0;\n                const timer = setInterval(() => {\n                    if (window.Hls) { clearInterval(timer); resolve(window.Hls); }\n                    else if (++tries > 80) { clearInterval(timer); reject(new Error('HLS.js لم يجهز')); }\n                }, 100);\n                return;\n            }\n            const script = document.createElement('script');\n            script.src = HLS_JS;\n            script.async = true;\n            script.dataset.coursatkHls = '1';\n            script.onload = () => window.Hls ? resolve(window.Hls) : reject(new Error('HLS.js غير متاح'));\n            script.onerror = () => reject(new Error('فشل تحميل HLS.js'));\n            document.head.appendChild(script);\n        });\n    }\n\n    async function getPlaybackForPlayer(videoId) {\n        const res = await fetch(`/api/play/${encodeURIComponent(videoId)}`, {\n            method: 'POST',\n            headers: { 'Accept': 'application/json' },\n            credentials: 'same-origin',\n            cache: 'no-store'\n        });\n        let data = null;\n        try { data = await res.json(); } catch {}\n        if (!res.ok) throw new Error(data?.message || `Playback HTTP ${res.status}`);\n        if (!data?.success || !data?.data?.manifest_url || !data?.data?.session) {\n            throw new Error('بيانات التشغيل ناقصة');\n        }\n        return data.data;\n    }\n\n    async function loadPlayerCrypto() {\n        if (window.DecryptionUtils?.decryptPlaybackKey) return window.DecryptionUtils;\n        return new Promise((resolve, reject) => {\n            const existing = document.querySelector('script[data-sw-player]');\n            if (existing) {\n                let tries = 0;\n                const timer = setInterval(() => {\n                    if (window.DecryptionUtils?.decryptPlaybackKey) { clearInterval(timer); resolve(window.DecryptionUtils); }\n                    else if (++tries > 100) { clearInterval(timer); reject(new Error('أدوات التشفير لم تجهز')); }\n                }, 100);\n                return;\n            }\n            const script = document.createElement('script');\n            script.src = PLAYER_JS;\n            script.dataset.swPlayer = '1';\n            script.onload = () => {\n                let tries = 0;\n                const timer = setInterval(() => {\n                    if (window.DecryptionUtils?.decryptPlaybackKey) { clearInterval(timer); resolve(window.DecryptionUtils); }\n                    else if (++tries > 100) { clearInterval(timer); reject(new Error('أدوات التشفير لم تجهز')); }\n                }, 100);\n            };\n            script.onerror = () => reject(new Error('فشل تحميل أدوات المشغل'));\n            document.head.appendChild(script);\n        });\n    }\n\n    function createPlayerOverlay(videoId, title) {\n        destroyPlayer();\n        const overlay = document.createElement('div');\n        overlay.id = 'sw-player-overlay';\n        overlay.innerHTML = `\n            <div class=\"sw-player-shell\">\n                <div class=\"sw-player-head\">\n                    <div class=\"sw-player-title\"></div>\n                    <button class=\"sw-player-close\" type=\"button\">✕</button>\n                </div>\n                <div class=\"sw-video-wrap\">\n                    <video class=\"sw-video\" playsinline controls preload=\"none\"></video>\n                    <div class=\"sw-player-start\">\n                        <button class=\"sw-big-play\" type=\"button\" aria-label=\"تشغيل\"><span>▶</span></button>\n                        <div class=\"sw-start-text\">اضغط تشغيل لبدء جلب الفيديو</div>\n                    </div>\n                    <div class=\"sw-player-loading\">\n                        <div class=\"sw-spinner\"></div>\n                        <div class=\"sw-player-loading-text\">جاري تجهيز الفيديو...</div>\n                    </div>\n                    <div class=\"sw-player-error\"></div>\n                </div>\n                <div class=\"sw-player-info\">\n                    <span class=\"sw-player-status\">في انتظار التشغيل</span>\n                    <span class=\"sw-player-time\">0:00 / --:--</span>\n                    <span class=\"sw-player-progress\">0%</span>\n                </div>\n            </div>`;\n        document.body.appendChild(overlay);\n\n        const video=overlay.querySelector('.sw-video'), close=overlay.querySelector('.sw-player-close');\n        const titleEl=overlay.querySelector('.sw-player-title'), startLayer=overlay.querySelector('.sw-player-start');\n        const bigPlay=overlay.querySelector('.sw-big-play'), loading=overlay.querySelector('.sw-player-loading');\n        const loadingText=overlay.querySelector('.sw-player-loading-text'), errorEl=overlay.querySelector('.sw-player-error');\n        const statusEl=overlay.querySelector('.sw-player-status'), timeEl=overlay.querySelector('.sw-player-time');\n        const progressEl=overlay.querySelector('.sw-player-progress');\n        titleEl.textContent=title||'فيديو';\n        const player={videoId,title,overlay,video,startLayer,bigPlay,loading,loadingText,errorEl,statusEl,timeEl,progressEl,hls:null,destroyed:false,started:false,duration:0,lastSaved:0,savedState:getWatchState(videoId),abortController:new AbortController(),blobUrls:[]};\n        STATE.player=player;\n        close.onclick=destroyPlayer;\n        overlay.addEventListener('click',e=>{if(e.target===overlay)destroyPlayer()});\n\n        const start=()=>{if(player.destroyed||player.started)return;player.started=true;startLayer.style.display='none';startHLSPlayer(player)};\n        bigPlay.onclick=e=>{e.preventDefault();e.stopPropagation();haptic();start()};\n        video.addEventListener('play',()=>{if(!player.started)start();statusEl.textContent='يعمل'});\n        video.addEventListener('pause',()=>{if(!video.ended)statusEl.textContent='متوقف مؤقتًا'});\n        video.addEventListener('timeupdate',()=>{\n            if(player.destroyed)return;\n            const d=Number(video.duration), t=Number(video.currentTime)||0, real=Number.isFinite(d)&&d>0?d:player.duration;\n            const pct=real>0?Math.min(100,t/real*100):0;\n            timeEl.textContent=`${formatDuration(t)} / ${formatDuration(real)||'--:--'}`;progressEl.textContent=`${Math.round(pct)}%`;\n            if(Date.now()-player.lastSaved>=1000){player.lastSaved=Date.now();saveWatchState(videoId,{currentTime:t,duration:real,percent:pct,watched:pct>=90});updateVideoCardProgress(videoId)}\n        });\n        video.addEventListener('durationchange',()=>{if(Number.isFinite(video.duration)&&video.duration>0){player.duration=video.duration;timeEl.textContent=`${formatDuration(video.currentTime)} / ${formatDuration(video.duration)}`}});\n        video.addEventListener('loadedmetadata',()=>{if(player.savedState?.currentTime>0){try{const d=video.duration||player.duration;const resume=Math.min(Number(player.savedState.currentTime),Math.max(0,d-.5));if(resume>0)video.currentTime=resume}catch{}}});\n        video.addEventListener('ended',()=>{const d=Number(video.duration)||player.duration||0;saveWatchState(videoId,{currentTime:d,duration:d,percent:100,watched:true});progressEl.textContent='100%';timeEl.textContent=`${formatDuration(d)} / ${formatDuration(d)}`;statusEl.textContent='تمت المشاهدة';updateVideoCardProgress(videoId)});\n        video.addEventListener('error',()=>{if(!player.destroyed&&video.error)showPlayerError(player,'الفيديو لم يُشغّل. جرّب تشغيله مرة أخرى.')});\n        showPlayerLoading(player,'اضغط تشغيل لبدء جلب الفيديو');\n        return player;\n    }\n\n    function showPlayerLoading(player,message){player.loadingText.textContent=message||'جاري التحميل...';player.loading.style.display='flex'}\n    function hidePlayerLoading(player){player.loading.style.display='none'}\n    function showPlayerError(player,message){player.errorEl.textContent=message||'حصل خطأ أثناء تشغيل الفيديو';player.errorEl.style.display='block';player.loading.style.display='none';player.startLayer.style.display='flex';player.statusEl.textContent='خطأ في التشغيل'}\n\n    async function prepareHLSSource(player, playback) {\n        showPlayerLoading(player, 'جاري تجهيز بيانات الفيديو...');\n\n        const manifestUrl = location.origin + playback.manifest_url;\n        const manifestRes = await fetch(manifestUrl, { cache: 'no-store' });\n        if (!manifestRes.ok) throw new Error(`Manifest HTTP ${manifestRes.status}`);\n\n        const manifestText = await manifestRes.text();\n        const lines = manifestText.split(/\\r?\\n/);\n        const streamId = String(playback.video_id || player.videoId);\n\n        let keyIndex = -1;\n        for (let i = 0; i < lines.length; i++) {\n            if (lines[i].trim().startsWith('#EXT-X-KEY:')) {\n                keyIndex = i;\n                break;\n            }\n        }\n\n        if (keyIndex < 0) throw new Error('لم يتم العثور على مفتاح HLS');\n\n        const keyLine = lines[keyIndex].trim();\n        const uriMatch = keyLine.match(/URI=\"([^\"]+)\"/);\n        if (!uriMatch) throw new Error('رابط المفتاح ناقص');\n\n        const keyUrl = new URL(uriMatch[1], manifestUrl).href;\n        showPlayerLoading(player, 'جاري فك مفتاح الفيديو...');\n\n        const keyRes = await fetch(keyUrl, {\n            cache: 'no-store',\n            signal: player.abortController.signal\n        });\n        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);\n\n        const wrappedKey = new Uint8Array(await keyRes.arrayBuffer());\n        const crypto = await loadPlayerCrypto();\n        const keyResult = await crypto.decryptPlaybackKey(wrappedKey, streamId);\n        const aesKey = keyResult?.key;\n\n        if (!aesKey || aesKey.byteLength !== 16) {\n            throw new Error('فشل تجهيز مفتاح الفيديو');\n        }\n\n        const keyBlobUrl = URL.createObjectURL(\n            new Blob([aesKey], { type: 'application/octet-stream' })\n        );\n        player.blobUrls.push(keyBlobUrl);\n\n        const rewritten = lines.map((raw, i) => {\n            let line = raw;\n            if (i === keyIndex) {\n                line = line.replace(/URI=\"[^\"]+\"/, `URI=\"${keyBlobUrl}\"`);\n                return line;\n            }\n            return line;\n        });\n\n        const sourceBlob = new Blob([rewritten.join('\\n')], {\n            type: 'application/vnd.apple.mpegurl'\n        });\n        const sourceUrl = URL.createObjectURL(sourceBlob);\n        player.blobUrls.push(sourceUrl);\n\n        return { sourceUrl };\n    }\n\n    async function startHLSPlayer(player){\n        if (player.destroyed) return;\n        try {\n            const Hls = await loadHlsJS();\n            const playback = await getPlaybackForPlayer(player.videoId);\n            player.session = playback.session;\n\n            const prepared = await prepareHLSSource(player, playback);\n\n            if (!Hls.isSupported()) {\n                player.video.src = prepared.sourceUrl;\n                hidePlayerLoading(player);\n                try { await player.video.play(); } catch {}\n                return;\n            }\n\n            const hls = new Hls({\n                enableWorker: true,\n                lowLatencyMode: false,\n                maxBufferLength: 18,\n                maxMaxBufferLength: 18,\n                maxBufferSize: 2 * 1024 * 1024,\n                backBufferLength: 8,\n                maxBufferHole: 0.5,\n                startLevel: -1,\n                capLevelToPlayerSize: true,\n                startPosition: player.savedState?.currentTime > 0\n                    ? Number(player.savedState.currentTime)\n                    : -1,\n                xhrSetup: (xhr, url) => {\n                    // كل الطلبات الخاصة بالفيديو تمر عبر Railway،\n                    // لذلك لا نرسل توكن المستخدم من المتصفح.\n                    xhr.setRequestHeader('Cache-Control', 'no-cache');\n                }\n            });\n\n            player.hls = hls;\n\n            hls.on(Hls.Events.MANIFEST_PARSED, async () => {\n                hidePlayerLoading(player);\n                player.statusEl.textContent = 'جاهز للتشغيل';\n                try {\n                    await player.video.play();\n                } catch {\n                    player.startLayer.style.display = 'flex';\n                    player.statusEl.textContent = 'اضغط تشغيل';\n                }\n            });\n\n            hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {\n                const d = Number(data?.details?.totalduration);\n                if (d > 0) {\n                    player.duration = d;\n                    player.timeEl.textContent = `0:00 / ${formatDuration(d)}`;\n                }\n            });\n\n            hls.on(Hls.Events.ERROR, (_, data) => {\n                if (!data?.fatal) return;\n                console.warn('[SW] HLS error:', data);\n                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {\n                    player.statusEl.textContent = 'إعادة الاتصال...';\n                    try { hls.startLoad(); } catch {}\n                    return;\n                }\n                if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {\n                    player.statusEl.textContent = 'إصلاح مسار الفيديو...';\n                    try { hls.recoverMediaError(); } catch {}\n                    return;\n                }\n                showPlayerError(player, `HLS: ${data.details || 'فشل تشغيل الفيديو'}`);\n            });\n\n            hls.attachMedia(player.video);\n            hls.loadSource(prepared.sourceUrl);\n        } catch(e) {\n            if (e.message === 'ABORTED' || player.destroyed) return;\n            console.error('[SW] HLS player error:', e);\n            showPlayerError(player, e.message || 'فشل تشغيل الفيديو');\n        }\n    }\n\n    function updateVideoCardProgress(videoId){\n        const card=document.querySelector(`[data-sw-video-id=\"${CSS.escape(String(videoId))}\"]`);if(!card)return;\n        const state=getWatchState(videoId);if(!state)return;\n        const pct=Math.round(state.percent||0),chip=card.querySelector('.sw-watch-chip'),btn=card.querySelector('.sw-video-action');\n        if(chip){chip.textContent=state.watched?'✓ تمت المشاهدة':`${pct}%`;chip.className=`sw-chip sw-watch-chip ${state.watched?'sw-chip-green':'sw-chip-orange'}`}\n        if(btn)btn.innerHTML=state.watched?'▶️ إعادة':(pct>0?'▶️ متابعة':'▶️ تشغيل');\n        if(state.watched||pct>0)card.classList.add('sw-card-accent');\n    }\n\n    function openVideoPlayer(videoId,title){return createPlayerOverlay(videoId,title)}\n\n    // =========================================================\n    // UI CONTROLLER\n    // =========================================================\n    const UI = {\n        panel: null,\n        contentEl: null,\n        breadcrumbEl: null,\n        backBtn: null,\n        ready: false,\n\n        init() {\n            injectStyles();\n            this.build();\n            this.bindDrag();\n            this.updateBreadcrumb();\n            this.ready = true;\n            console.log('[SW] ✅ UI جاهز');\n        },\n\n        build() {\n            const old = $('sw-panel');\n            if (old) old.remove();\n            const oldToggle = $('sw-toggle');\n            if (oldToggle) oldToggle.remove();\n\n            const toggle = el('button');\n            toggle.id = 'sw-toggle';\n            toggle.innerHTML = '▶';\n            toggle.onclick = () => UI.togglePanel();\n            document.body.appendChild(toggle);\n\n            const panel = el('div');\n            panel.id = 'sw-panel';\n            panel.innerHTML = `\n                <div class=\"sw-handle\" id=\"sw-handle\"></div>\n                <div class=\"sw-header\">\n                    <button class=\"sw-icon-btn sw-hidden\" id=\"sw-back\">←</button>\n                    <div class=\"sw-brand\">\n                        <h3>Coursatk</h3>\n                        <p>v6.0 • HLS Stream • تحميل عند التشغيل فقط</p>\n                    </div>\n                    <button class=\"sw-close\" id=\"sw-close\">✕</button>\n                </div>\n                <div class=\"sw-breadcrumb\" id=\"sw-breadcrumb\"></div>\n                <div class=\"sw-content\" id=\"sw-content\"></div>\n                <div class=\"sw-footer sw-hidden\" id=\"sw-footer\">\n                    <div class=\"sw-progress-head\">\n                        <div class=\"sw-progress-label\" id=\"sw-progress-label\">جاهز</div>\n                        <div class=\"sw-progress-percent\" id=\"sw-progress-percent\">0%</div>\n                    </div>\n                    <div class=\"sw-progress-track\">\n                        <div class=\"sw-progress-fill\" id=\"sw-progress-fill\"></div>\n                    </div>\n                    <div class=\"sw-progress-meta\">\n                        <span id=\"sw-progress-size\">0 MB</span>\n                        <span id=\"sw-progress-speed\"></span>\n                    </div>\n                    <div class=\"sw-progress-actions\" id=\"sw-progress-actions\"></div>\n                </div>\n            `;\n            document.body.appendChild(panel);\n\n            this.panel = panel;\n            this.contentEl = $('sw-content');\n            this.breadcrumbEl = $('sw-breadcrumb');\n            this.backBtn = $('sw-back');\n\n            $('sw-close').onclick = () => this.hidePanel();\n\n            // ✅ ربط زر الرجوع - الإصلاح الرئيسي\n            this.backBtn.onclick = (e) => {\n                e.preventDefault();\n                e.stopPropagation();\n                haptic();\n                console.log('[SW] 🔙 زر الرجوع');\n                this.goBack();\n            };\n        },\n\n        bindDrag() {\n            const handle = $('sw-handle');\n            if (!handle) return;\n            let startY = 0, currentY = 0, dragging = false;\n\n            const onStart = (e) => {\n                dragging = true;\n                startY = e.touches ? e.touches[0].clientY : e.clientY;\n                this.panel.classList.add('sw-dragging');\n                this.panel.style.transition = 'none';\n            };\n            const onMove = (e) => {\n                if (!dragging) return;\n                currentY = (e.touches ? e.touches[0].clientY : e.clientY) - startY;\n                if (currentY < 0) currentY = 0;\n                this.panel.style.transform = `translateY(${currentY}px)`;\n            };\n            const onEnd = () => {\n                if (!dragging) return;\n                dragging = false;\n                this.panel.classList.remove('sw-dragging');\n                this.panel.style.transition = '';\n                this.panel.style.transform = '';\n                if (currentY > 100) this.hidePanel();\n                currentY = 0;\n            };\n\n            handle.addEventListener('touchstart', onStart, { passive: true });\n            handle.addEventListener('touchmove', onMove, { passive: true });\n            handle.addEventListener('touchend', onEnd);\n            handle.addEventListener('mousedown', onStart);\n            document.addEventListener('mousemove', onMove);\n            document.addEventListener('mouseup', onEnd);\n        },\n\n        togglePanel() {\n            haptic();\n            if (this.panel.classList.contains('sw-open')) this.hidePanel();\n            else this.showPanel();\n        },\n\n        showPanel() {\n            if (!this.panel) return;\n            this.panel.classList.add('sw-open');\n            const tgl = $('sw-toggle');\n            if (tgl) tgl.classList.add('sw-active');\n            STATE.ui.visible = true;\n            if (!STATE.cache.subjects && this.contentEl && this.contentEl.children.length === 0) {\n                console.log('[SW] 📚 تحميل المواد عند فتح اللوحة');\n                loadSubjects();\n            }\n        },\n\n        hidePanel() {\n            if (!this.panel) return;\n            this.panel.classList.remove('sw-open');\n            const tgl = $('sw-toggle');\n            if (tgl) tgl.classList.remove('sw-active');\n            STATE.ui.visible = false;\n        },\n\n        setContent(nodes) {\n            if (!this.contentEl) return;\n            this.contentEl.innerHTML = '';\n            if (Array.isArray(nodes)) {\n                nodes.forEach(n => n && this.contentEl.appendChild(n));\n            } else if (nodes) {\n                this.contentEl.appendChild(nodes);\n            }\n        },\n\n        showLoading() {\n            if (!this.contentEl) return;\n            const frag = document.createDocumentFragment();\n            for (let i = 0; i < 5; i++) {\n                frag.appendChild(el('div', 'sw-skeleton'));\n            }\n            this.setContent(frag);\n        },\n\n        showEmpty(icon, title, desc) {\n            if (!this.contentEl) return;\n            const wrap = el('div', 'sw-state');\n            wrap.innerHTML = `\n                <div class=\"sw-state-icon\">${icon}</div>\n                <div class=\"sw-state-title\">${title}</div>\n                ${desc ? `<div class=\"sw-state-desc\">${desc}</div>` : ''}\n            `;\n            this.setContent(wrap);\n        },\n\n        showError(msg, retryFn) {\n            if (!this.contentEl) return;\n            const wrap = el('div', 'sw-state');\n            wrap.innerHTML = `\n                <div class=\"sw-state-icon\">⚠️</div>\n                <div class=\"sw-state-title\">حدث خطأ</div>\n                <div class=\"sw-state-desc\">${msg}</div>\n            `;\n            if (retryFn) {\n                const btn = el('button', 'sw-btn sw-btn-primary');\n                btn.textContent = '🔄 إعادة المحاولة';\n                btn.onclick = retryFn;\n                wrap.appendChild(btn);\n            }\n            this.setContent(wrap);\n        },\n\n        sectionTitle(text) {\n            return el('div', 'sw-section', text);\n        },\n\n        card({ icon, title, sub, chips, action, onClick, accent }) {\n            const card = el('div', 'sw-card' + (accent ? ' sw-card-accent' : ''));\n            if (onClick) {\n                card.onclick = () => { haptic(); onClick(); };\n            }\n\n            if (icon) {\n                const ic = el('div', 'sw-card-icon');\n                ic.textContent = icon;\n                card.appendChild(ic);\n            }\n\n            const body = el('div', 'sw-card-body');\n            body.appendChild(el('div', 'sw-card-title', title));\n\n            if (sub || chips) {\n                const subEl = el('div', 'sw-card-sub');\n                if (sub) subEl.appendChild(el('span', null, sub));\n                if (chips) {\n                    chips.forEach(c => {\n                        const chip = el('span', `sw-chip ${c.cls || ''}`);\n                        chip.textContent = c.text;\n                        subEl.appendChild(chip);\n                    });\n                }\n                body.appendChild(subEl);\n            }\n            card.appendChild(body);\n\n            if (action) {\n                const btn = el('button', `sw-btn ${action.cls || 'sw-btn-primary'}`);\n                btn.innerHTML = action.label;\n                btn.onclick = (e) => {\n                    e.stopPropagation();\n                    e.preventDefault();\n                    haptic();\n                    action.onClick(btn);\n                };\n                card.appendChild(btn);\n            } else if (onClick) {\n                const chev = el('div', 'sw-chevron', '‹');\n                card.appendChild(chev);\n            }\n\n            return card;\n        },\n\n        updateBreadcrumb() {\n            if (!this.breadcrumbEl) return;\n            this.breadcrumbEl.innerHTML = '';\n\n            // ✅ الرئيسية + الـ stack\n            const crumbs = [{ label: 'الرئيسية', index: 0 }];\n            STATE.stack.forEach((s, i) => {\n                crumbs.push({ label: s.label, index: i + 1 });\n            });\n\n            crumbs.forEach((c, i) => {\n                if (i > 0) {\n                    this.breadcrumbEl.appendChild(el('span', 'sw-sep', '›'));\n                }\n                const span = el('span');\n                span.textContent = c.label;\n                if (i === crumbs.length - 1) {\n                    span.className = 'sw-crumb-current';\n                } else {\n                    span.className = 'sw-crumb-link';\n                    span.onclick = (e) => {\n                        e.stopPropagation();\n                        haptic();\n                        console.log(`[SW] 🔙 breadcrumb → index ${c.index}`);\n                        this.goBackTo(c.index);\n                    };\n                }\n                this.breadcrumbEl.appendChild(span);\n            });\n\n            // ✅ إظهار/إخفاء زر الرجوع\n            if (this.backBtn) {\n                if (STATE.stack.length > 0) {\n                    this.backBtn.classList.remove('sw-hidden');\n                } else {\n                    this.backBtn.classList.add('sw-hidden');\n                }\n            }\n        },\n\n        setDownloading(title) {\n            const footer = $('sw-footer');\n            if (!footer) return;\n            footer.classList.remove('sw-hidden');\n            $('sw-progress-label').textContent = title || 'تحميل...';\n            $('sw-progress-fill').classList.remove('sw-paused');\n            $('sw-progress-actions').innerHTML = '';\n\n            const pauseBtn = el('button', 'sw-btn sw-btn-secondary');\n            pauseBtn.id = 'sw-pause-btn';\n            pauseBtn.innerHTML = '⏸️ إيقاف';\n            pauseBtn.onclick = (e) => { e.stopPropagation(); this.togglePause(); };\n            $('sw-progress-actions').appendChild(pauseBtn);\n\n            const cancelBtn = el('button', 'sw-btn sw-btn-secondary');\n            cancelBtn.style.color = '#f44336';\n            cancelBtn.innerHTML = '⏹️ إلغاء';\n            cancelBtn.onclick = (e) => { e.stopPropagation(); this.cancelDownload(); };\n            $('sw-progress-actions').appendChild(cancelBtn);\n\n            this.lockNavigation(true);\n        },\n\n        lockNavigation(lock) {\n            if (!this.contentEl) return;\n            const cards = this.contentEl.querySelectorAll('.sw-card');\n            cards.forEach(c => {\n                if (lock) c.style.pointerEvents = 'none';\n                else c.style.pointerEvents = '';\n            });\n        },\n\n        updateProgress(percent, label, size, speed) {\n            const fill = $('sw-progress-fill');\n            const pct = $('sw-progress-percent');\n            const lbl = $('sw-progress-label');\n            const sz = $('sw-progress-size');\n            const sp = $('sw-progress-speed');\n            if (fill) fill.style.width = percent + '%';\n            if (pct) pct.textContent = percent + '%';\n            if (lbl) lbl.textContent = label;\n            if (sz) sz.textContent = formatSize(size);\n            if (sp) sp.textContent = speed > 0 ? formatSize(speed) + '/s' : '';\n        },\n\n        togglePause() {\n            const dl = STATE.download;\n            if (!dl) return;\n            dl.paused = !dl.paused;\n            const btn = $('sw-pause-btn');\n            const fill = $('sw-progress-fill');\n            if (dl.paused) {\n                btn.innerHTML = '▶️ استئناف';\n                btn.style.background = 'rgba(76,175,80,0.15)';\n                btn.style.color = '#4CAF50';\n                fill.classList.add('sw-paused');\n                showToast('⏸️ تم الإيقاف — التقدم محفوظ', 'info');\n            } else {\n                btn.innerHTML = '⏸️ إيقاف';\n                btn.style.background = '';\n                btn.style.color = '';\n                fill.classList.remove('sw-paused');\n                showToast('▶️ تم الاستئناف', 'success');\n            }\n        },\n\n        cancelDownload() {\n            const dl = STATE.download;\n            if (!dl) return;\n            dl.aborted = true;\n            dl.abortController.abort();\n        },\n\n        setDownloadDone() {\n            setTimeout(() => {\n                STATE.download = null;\n                const footer = $('sw-footer');\n                if (footer) footer.classList.add('sw-hidden');\n                this.lockNavigation(false);\n            }, 2500);\n        },\n\n        setDownloadIdle() {\n            // ✅ ما نمسحش STATE.download — نخليه عشان نقدر نستأنف\n            const footer = $('sw-footer');\n            if (footer) footer.classList.add('sw-hidden');\n            this.lockNavigation(false);\n        },\n\n        pushStack(label, view) {\n            STATE.stack.push({\n                label,\n                view,\n                scrollTop: this.contentEl ? this.contentEl.scrollTop : 0\n            });\n            this.updateBreadcrumb();\n        },\n\n        // ✅ إصلاح دالة الرجوع\n        goBack() {\n            if (STATE.stack.length === 0) {\n                console.log('[SW] 🔙 ما فيش stack — نرجع للرئيسية');\n                loadSubjects(true);\n                return;\n            }\n            console.log(`[SW] 🔙 رجوع — stack قبل: ${STATE.stack.length}`);\n            STATE.stack.pop();\n            console.log(`[SW] 🔙 stack بعد: ${STATE.stack.length}`);\n            this.updateBreadcrumb();\n\n            const parent = STATE.stack[STATE.stack.length - 1];\n            if (parent) {\n                this.navigateTo(parent.view);\n            } else {\n                loadSubjects(true);\n            }\n        },\n\n        goBackTo(index) {\n            // index 0 = الرئيسية\n            // index 1 = أول عنصر في stack\n            // index n = العنصر رقم n-1\n            if (index === 0) {\n                STATE.stack = [];\n                this.updateBreadcrumb();\n                loadSubjects(true);\n                return;\n            }\n            // نحتفظ بأول index عنصر ونشيل الباقي\n            STATE.stack = STATE.stack.slice(0, index);\n            this.updateBreadcrumb();\n            const target = STATE.stack[STATE.stack.length - 1];\n            if (target) {\n                this.navigateTo(target.view);\n            } else {\n                loadSubjects(true);\n            }\n        },\n\n        // ✅ دالة تنقل موحدة\n        navigateTo(view) {\n            if (view === 'subjects') {\n                loadSubjects(true);\n            } else if (view === 'teachers') {\n                // آخر subject\n                const lastSubject = STATE.stack[0]?._ref;\n                if (lastSubject) loadTeachers(lastSubject, false);\n                else loadSubjects(true);\n            } else if (view === 'chapters') {\n                const lastTeacher = STATE.stack[1]?._ref;\n                if (lastTeacher) loadChapters(lastTeacher, false);\n                else loadSubjects(true);\n            } else if (view === 'lectures') {\n                const lastChapter = STATE.stack[2]?._ref;\n                if (lastChapter) loadLectures(lastChapter, false);\n                else loadSubjects(true);\n            } else if (view === 'content') {\n                const lastLecture = STATE.stack[3]?._ref;\n                if (lastLecture) loadLectureContent(lastLecture, false);\n                else loadSubjects(true);\n            } else {\n                loadSubjects(true);\n            }\n        }\n    };\n\n    // =========================================================\n    // VIEWS\n    // =========================================================\n    async function loadSubjects(skipPush = false) {\n        if (!UI.contentEl) {\n            setTimeout(() => loadSubjects(skipPush), 300);\n            return;\n        }\n        if (skipPush) STATE.stack = [];\n        STATE.view = 'subjects';\n        UI.updateBreadcrumb();\n        UI.showLoading();\n\n        try {\n            const res = await apiGet(`/api/subjects/${CONFIG.YEAR_ID}`);\n            const subjects = res.data || [];\n            STATE.cache.subjects = subjects;\n            console.log(`[SW] ✅ تم تحميل ${subjects.length} مادة`);\n            renderSubjects(subjects);\n        } catch (e) {\n            console.error('[SW] loadSubjects error:', e);\n            UI.showError(e.message, () => loadSubjects(skipPush));\n        }\n    }\n\n    function renderSubjects(subjects) {\n        if (!UI.contentEl) return;\n        if (!subjects.length) {\n            UI.showEmpty('📚', 'لا توجد مواد', 'لم يتم العثور على مواد متاحة');\n            return;\n        }\n\n        const frag = document.createDocumentFragment();\n        frag.appendChild(UI.sectionTitle(`المواد • ${subjects.length}`));\n\n        subjects.forEach(s => {\n            frag.appendChild(UI.card({\n                icon: '📘',\n                title: s.name,\n                chips: [{ text: `${s.id}`, cls: 'sw-chip-blue' }],\n                onClick: () => loadTeachers(s, true)\n            }));\n        });\n\n        UI.setContent(frag);\n        if (UI.contentEl) UI.contentEl.scrollTop = 0;\n    }\n\n    // ✅ كل loaders بتاخد pushStack flag\n    async function loadTeachers(subject, pushStack = true) {\n        if (!UI.contentEl) return;\n        if (pushStack) {\n            UI.pushStack(subject.name, 'teachers');\n            // نحفظ المرجع\n            STATE.stack[STATE.stack.length - 1]._ref = subject;\n        }\n        STATE.view = 'teachers';\n        UI.updateBreadcrumb();\n        UI.showLoading();\n\n        try {\n            const res = await apiGet(`/api/subjects/${subject.id}/teachers`);\n            const teachers = res.data?.teachers || res.data || [];\n            STATE.cache['teachers_' + subject.id] = teachers;\n            console.log(`[SW] ✅ تم تحميل ${teachers.length} مدرس`);\n            renderTeachers(teachers, subject);\n        } catch (e) {\n            console.error('[SW] loadTeachers error:', e);\n            UI.showError(e.message, () => loadTeachers(subject, pushStack));\n        }\n    }\n\n    function renderTeachers(teachers, subject) {\n        if (!UI.contentEl) return;\n        if (!teachers.length) {\n            UI.showEmpty('👨‍🏫', 'لا يوجد مدرسين', `لا يوجد مدرسين لمادة ${subject.name}`);\n            return;\n        }\n\n        const frag = document.createDocumentFragment();\n        frag.appendChild(UI.sectionTitle(`مدرسين ${subject.name} • ${teachers.length}`));\n\n        teachers.forEach(t => {\n            frag.appendChild(UI.card({\n                icon: '👨‍🏫',\n                title: t.name,\n                chips: [{ text: `${t.chapter_count} شابتر`, cls: 'sw-chip-green' }],\n                onClick: () => loadChapters(t, true)\n            }));\n        });\n\n        UI.setContent(frag);\n        if (UI.contentEl) UI.contentEl.scrollTop = 0;\n    }\n\n    async function loadChapters(teacher, pushStack = true) {\n        if (!UI.contentEl) return;\n        if (pushStack) {\n            UI.pushStack(teacher.name, 'chapters');\n            STATE.stack[STATE.stack.length - 1]._ref = teacher;\n        }\n        STATE.view = 'chapters';\n        UI.updateBreadcrumb();\n        UI.showLoading();\n\n        try {\n            const res = await apiGet(`/api/teachers/${teacher.id}/chapters`);\n            const chapters = res.data || [];\n            STATE.cache['chapters_' + teacher.id] = chapters;\n            console.log(`[SW] ✅ تم تحميل ${chapters.length} شابتر`);\n            renderChapters(chapters, teacher);\n        } catch (e) {\n            console.error('[SW] loadChapters error:', e);\n            UI.showError(e.message, () => loadChapters(teacher, pushStack));\n        }\n    }\n\n    function renderChapters(chapters, teacher) {\n        if (!UI.contentEl) return;\n        if (!chapters.length) {\n            UI.showEmpty('📖', 'لا يوجد شباتر', `لا يوجد شباتر للمدرس ${teacher.name}`);\n            return;\n        }\n\n        const frag = document.createDocumentFragment();\n        frag.appendChild(UI.sectionTitle(`شباتر ${teacher.name} • ${chapters.length}`));\n\n        chapters.forEach(c => {\n            frag.appendChild(UI.card({\n                icon: '📖',\n                title: c.name,\n                chips: [{ text: `${c.lecture_count} محاضرة`, cls: 'sw-chip-green' }],\n                onClick: () => loadLectures(c, true)\n            }));\n        });\n\n        UI.setContent(frag);\n        if (UI.contentEl) UI.contentEl.scrollTop = 0;\n    }\n\n    async function loadLectures(chapter, pushStack = true) {\n        if (!UI.contentEl) return;\n        if (pushStack) {\n            UI.pushStack(chapter.name, 'lectures');\n            STATE.stack[STATE.stack.length - 1]._ref = chapter;\n        }\n        STATE.view = 'lectures';\n        UI.updateBreadcrumb();\n        UI.showLoading();\n\n        try {\n            const res = await apiGet(`/api/chapters/${chapter.id}/lectures`);\n            const lectures = res.data || [];\n            STATE.cache['lectures_' + chapter.id] = lectures;\n            console.log(`[SW] ✅ تم تحميل ${lectures.length} محاضرة`);\n            renderLectures(lectures, chapter);\n        } catch (e) {\n            console.error('[SW] loadLectures error:', e);\n            UI.showError(e.message, () => loadLectures(chapter, pushStack));\n        }\n    }\n\n    function renderLectures(lectures, chapter) {\n        if (!UI.contentEl) return;\n        if (!lectures.length) {\n            UI.showEmpty('🎓', 'لا يوجد محاضرات', `لا يوجد محاضرات في ${chapter.name}`);\n            return;\n        }\n\n        const frag = document.createDocumentFragment();\n        frag.appendChild(UI.sectionTitle(`محاضرات • ${lectures.length}`));\n\n        lectures.forEach(l => {\n            frag.appendChild(UI.card({\n                icon: '🎓',\n                title: l.name,\n                onClick: () => loadLectureContent(l, true)\n            }));\n        });\n\n        UI.setContent(frag);\n        if (UI.contentEl) UI.contentEl.scrollTop = 0;\n    }\n\n    async function loadLectureContent(lecture, pushStack = true) {\n        if (!UI.contentEl) return;\n        if (pushStack) {\n            UI.pushStack(lecture.name, 'content');\n            STATE.stack[STATE.stack.length - 1]._ref = lecture;\n        }\n        STATE.view = 'content';\n        UI.updateBreadcrumb();\n        UI.showLoading();\n\n        try {\n            const res = await apiGet(`/api/lectures/${lecture.id}/content`);\n            const d = res.data || {};\n            const content = {\n                videos: d.videos || [],\n                pdfs: d.pdfs || [],\n                exams: d.exams || []\n            };\n            STATE.cache['content_' + lecture.id] = content;\n            console.log(`[SW] ✅ محتوى: ${content.videos.length} فيديو، ${content.pdfs.length} PDF، ${content.exams.length} امتحان`);\n            renderContent(content, lecture);\n        } catch (e) {\n            console.error('[SW] loadLectureContent error:', e);\n            UI.showError(e.message, () => loadLectureContent(lecture, pushStack));\n        }\n    }\n\n    async function renderContent(content, lecture) {\n        if (!UI.contentEl) return;\n        const frag = document.createDocumentFragment();\n\n        if (content.videos.length) {\n            frag.appendChild(UI.sectionTitle(`🎬 فيديوهات • ${content.videos.length}`));\n\n            for (const v of content.videos) {\n                const state = getWatchState(v.id);\n                const pct = Math.round(state?.percent || 0);\n                const chips = [];\n\n                if (v.duration || v.duration_seconds) {\n                    chips.push({\n                        text: formatDuration(Number(v.duration || v.duration_seconds)),\n                        cls: 'sw-chip-blue'\n                    });\n                }\n\n                if (state?.watched) {\n                    chips.push({ text: '✓ تمت المشاهدة', cls: 'sw-chip-green' });\n                } else if (pct > 0) {\n                    chips.push({ text: `${pct}%`, cls: 'sw-chip-orange' });\n                } else {\n                    chips.push({ text: 'لم تبدأ', cls: '' });\n                }\n\n                const card = UI.card({\n                    icon: '▶',\n                    title: v.title,\n                    chips,\n                    action: {\n                        label: state?.watched ? '▶️ إعادة' : (pct > 0 ? '▶️ متابعة' : '▶️ تشغيل'),\n                        cls: 'sw-btn-primary sw-video-action',\n                        onClick: async (btn) => {\n                            btn.disabled = true;\n                            try {\n                                openVideoPlayer(v.id, v.title);\n                            } finally {\n                                setTimeout(() => { btn.disabled = false; }, 500);\n                            }\n                        }\n                    }\n                });\n\n                card.dataset.swVideoId = String(v.id);\n                card.querySelector('.sw-video-action')?.classList.add('sw-video-action');\n                if (pct > 0 || state?.watched) card.classList.add('sw-card-accent');\n\n                // عنصر مخفي/مرئي صغير لتحديث سجل المشاهدة من خارج الـ card.\n                const watchChip = card.querySelector('.sw-chip-orange, .sw-chip-green, .sw-chip:not(.sw-chip-blue)');\n                if (watchChip) watchChip.classList.add('sw-watch-chip');\n\n                frag.appendChild(card);\n            }\n        }\n\n        // ملفات PDF تظل مخفية افتراضيًا حتى يضغط المستخدم على زر الملفات.\n        if (content.pdfs && content.pdfs.length) {\n            const pdfToggle = UI.card({\n                icon: '▣',\n                title: `الملفات PDF • ${content.pdfs.length}`,\n                sub: 'اضغط لإظهار ملفات الـ PDF',\n                action: {\n                    label: 'إظهار',\n                    cls: 'sw-btn-secondary',\n                    onClick: (btn) => {\n                        const section = btn.closest('.sw-card')?.nextElementSibling;\n                        if (section?.classList.contains('sw-pdf-list')) {\n                            section.classList.toggle('sw-pdf-hidden');\n                            btn.textContent = section.classList.contains('sw-pdf-hidden') ? 'إظهار' : 'إخفاء';\n                        }\n                    }\n                }\n            });\n            frag.appendChild(pdfToggle);\n\n            const pdfList = el('div', 'sw-pdf-list sw-pdf-hidden');\n\n            content.pdfs.forEach(p => {\n                pdfList.appendChild(UI.card({\n                    icon: '▣',\n                    title: p.title,\n                    action: {\n                        label: 'فتح',\n                        cls: 'sw-btn-secondary',\n                        onClick: () => window.open(p.url, '_blank')\n                    }\n                }));\n            });\n            frag.appendChild(pdfList);\n        }\n\n        if (content.exams && content.exams.length) {\n            frag.appendChild(UI.sectionTitle(`📝 امتحانات • ${content.exams.length}`));\n            content.exams.forEach(e => {\n                frag.appendChild(UI.card({\n                    icon: '📝',\n                    title: e.title,\n                    chips: [\n                        { text: `${e.question_count} سؤال`, cls: 'sw-chip-orange' },\n                        { text: `${e.duration_minutes} د`, cls: 'sw-chip-blue' }\n                    ]\n                }));\n            });\n        }\n\n        if (!content.videos.length && !content.pdfs.length && !content.exams.length) {\n            UI.showEmpty('📭', 'لا يوجد محتوى', 'هذه المحاضرة لا تحتوي على محتوى بعد');\n            return;\n        }\n\n        UI.setContent(frag);\n        if (UI.contentEl) UI.contentEl.scrollTop = 0;\n    }\n\n    // =========================================================\n    // INIT\n    // =========================================================\n    function init() {\n        console.log('==============================================');\n        console.log('[SW] 📱 Coursatk Stream Server');\n        console.log('[SW] 🛡️ التشغيل عبر Railway + HLS');\n        console.log('==============================================');\n\n        injectStyles();\n        UI.init();\n\n        // ✅ إعداد المعالجات\n        \n\n        // ✅ تحميل المواد\n        setTimeout(() => {\n            loadSubjects().catch(e => console.warn('[SW] فشل التحميل الأولي', e));\n        }, 500);\n\n        \n\n        console.log('[SW] ▶ اضغط الزر لفتح المشغل');\n        console.log('==============================================');\n    }\n\n\nconst __origInit = init;\ninit = function() { __origInit(); const b=document.getElementById('server-open'); if(b) b.onclick=()=>UI.showPanel(); };\n\nif (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);\nelse init();\n</script>\n</body>\n</html>\n";
+// ---------------- Frontend (no client-side key crypto needed) ----------------
+const INDEX_HTML = `<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Coursatk</title>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+html,body{margin:0;min-height:100%;background:#050505;color:#fff;font-family:Cairo,system-ui,sans-serif}
+#coursatk-server-page{min-height:100vh;background:radial-gradient(circle at top,#171717,#050505 42%)}
+.server-hero{padding:28px 18px 20px;max-width:1100px;margin:auto}
+.server-hero-card{border:1px solid rgba(255,255,255,.08);border-radius:22px;background:linear-gradient(145deg,#151515,#0a0a0a);padding:18px;box-shadow:0 18px 55px rgba(0,0,0,.4)}
+.server-hero-title{font-size:20px;font-weight:800}
+.server-hero-sub{margin-top:4px;color:#888;font-size:11px}
+.server-hero-badge{display:inline-flex;margin-top:12px;padding:6px 10px;border-radius:999px;background:rgba(76,175,80,.12);color:#74e0a1;font-size:10px}
+.server-open{margin-top:12px;border:0;border-radius:12px;padding:10px 14px;background:linear-gradient(135deg,#4CAF50,#388E3C);color:#fff;font:700 12px Cairo;cursor:pointer}
+#sw-toggle{position:fixed;bottom:20px;right:20px;z-index:999998;width:62px;height:62px;border-radius:50%;border:none;background:linear-gradient(135deg,#4CAF50,#2E7D32);color:#fff;font-size:26px;cursor:pointer;box-shadow:0 8px 28px rgba(76,175,80,.45);display:flex;align-items:center;justify-content:center}
+#sw-toggle.sw-active{background:linear-gradient(135deg,#f44336,#c62828)}
+#sw-panel{position:fixed;left:0;right:0;bottom:0;z-index:999999;background:linear-gradient(180deg,rgba(20,22,28,.98),rgba(12,14,18,.99));backdrop-filter:blur(24px);border-top-left-radius:24px;border-top-right-radius:24px;border-top:1px solid rgba(255,255,255,.08);color:#fff;box-shadow:0 -20px 60px rgba(0,0,0,.9);transform:translateY(105%);transition:transform .42s cubic-bezier(.32,.72,0,1);max-height:88vh;display:flex;flex-direction:column;overflow:hidden}
+#sw-panel.sw-open{transform:translateY(0)}
+.sw-handle{width:100%;padding:10px 0 6px;display:flex;justify-content:center;cursor:grab}
+.sw-handle::before{content:'';width:42px;height:4px;border-radius:4px;background:rgba(255,255,255,.18)}
+.sw-header{display:flex;align-items:center;gap:10px;padding:4px 16px 12px}
+.sw-icon-btn,.sw-close{width:38px;height:38px;border:none;border-radius:12px;background:rgba(255,255,255,.06);color:#ccc;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.sw-icon-btn.sw-hidden{display:none}
+.sw-brand{flex:1;min-width:0}
+.sw-brand h3{margin:0;font-size:15px;font-weight:700}
+.sw-brand p{margin:1px 0 0;font-size:10px;color:#6b7280}
+.sw-breadcrumb{display:flex;align-items:center;gap:6px;padding:0 16px 12px;font-size:11px;color:#6b7280;overflow-x:auto}
+.sw-breadcrumb span{white-space:nowrap;padding:3px 8px;border-radius:6px}
+.sw-crumb-link{cursor:pointer;color:#9ca3af;background:rgba(255,255,255,.04)}
+.sw-crumb-current{color:#4CAF50;font-weight:600}
+.sw-sep{color:#374151;padding:0}
+.sw-content{flex:1;overflow-y:auto;padding:0 12px 16px;min-height:120px}
+.sw-section{display:flex;align-items:center;gap:8px;padding:14px 6px 8px;font-size:12px;font-weight:600;color:#6b7280;text-transform:uppercase}
+.sw-section::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,rgba(255,255,255,.08),transparent)}
+.sw-card{display:flex;align-items:center;gap:12px;padding:14px;margin-bottom:8px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.05);border-radius:14px;cursor:pointer}
+.sw-card-accent::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,#4CAF50,#2E7D32)}
+.sw-card{position:relative;overflow:hidden}
+.sw-card-icon{width:40px;height:40px;border-radius:11px;background:linear-gradient(135deg,rgba(76,175,80,.18),rgba(76,175,80,.06));display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;border:1px solid rgba(76,175,80,.15)}
+.sw-card-body{flex:1;min-width:0}
+.sw-card-title{font-size:14px;font-weight:600;color:#e5e7eb;line-height:1.35;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.sw-card-sub{font-size:11px;color:#6b7280;margin-top:3px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sw-chip{display:inline-flex;padding:2px 7px;background:rgba(255,255,255,.06);border-radius:6px;font-size:10px;font-weight:500;color:#9ca3af}
+.sw-chip-green{background:rgba(76,175,80,.15);color:#4CAF50}
+.sw-chip-blue{background:rgba(33,150,243,.15);color:#64b5f6}
+.sw-chip-orange{background:rgba(255,152,0,.15);color:#FFB74D}
+.sw-btn{padding:8px 14px;border:none;border-radius:10px;font-weight:600;font-size:12px;cursor:pointer;display:inline-flex;align-items:center;gap:5px;font-family:inherit}
+.sw-btn-primary{background:linear-gradient(135deg,#4CAF50,#388E3C);color:#fff}
+.sw-btn-secondary{background:rgba(255,255,255,.08);color:#d1d5db}
+.sw-skeleton{background:linear-gradient(90deg,rgba(255,255,255,.04),rgba(255,255,255,.08),rgba(255,255,255,.04));background-size:200% 100%;animation:swShimmer 1.4s infinite;border-radius:14px;height:68px;margin-bottom:8px}
+@keyframes swShimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.sw-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px 24px;text-align:center;color:#6b7280;gap:12px}
+.sw-state-icon{font-size:42px;opacity:.6}
+.sw-state-title{font-size:15px;font-weight:600;color:#9ca3af}
+.sw-state-desc{font-size:12px;color:#6b7280;max-width:260px;line-height:1.5}
+#sw-player-overlay{position:fixed;inset:0;z-index:1000001;background:#000;display:flex;align-items:center;justify-content:center}
+.sw-player-shell{width:100%;max-width:1200px;height:100%;max-height:100vh;display:flex;flex-direction:column;background:#000}
+.sw-player-head{min-height:54px;display:flex;align-items:center;gap:10px;padding:8px 12px;background:#070707;color:#fff}
+.sw-player-title{flex:1;min-width:0;font-size:14px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sw-player-close{width:40px;height:40px;border:0;border-radius:12px;background:#181818;color:#fff;cursor:pointer;font-size:17px}
+.sw-video-wrap{position:relative;width:100%;flex:1;min-height:0;background:#000;display:flex;align-items:center;justify-content:center}
+.sw-video{width:100%;height:100%;display:block;background:#000;object-fit:contain}
+.sw-player-start{position:absolute;inset:0;z-index:4;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:15px;background:#000}
+.sw-big-play{width:92px;height:92px;border:0;border-radius:50%;background:rgba(255,255,255,.12);color:#fff;font-size:39px;cursor:pointer;display:grid;place-items:center;padding-left:7px}
+.sw-start-text{color:#aaa;font-size:12px}
+.sw-player-loading{position:absolute;inset:0;z-index:5;display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:rgba(0,0,0,.88);color:#fff;pointer-events:none}
+.sw-spinner{width:34px;height:34px;border:3px solid rgba(255,255,255,.18);border-top-color:#fff;border-radius:50%;animation:swSpin .8s linear infinite}
+@keyframes swSpin{to{transform:rotate(360deg)}}
+.sw-player-error{display:none;position:absolute;z-index:8;left:12px;right:12px;bottom:12px;padding:11px 13px;border-radius:10px;background:rgba(125,18,18,.95);color:#fff;font-size:12px;line-height:1.6}
+.sw-player-info{min-height:42px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:#070707;color:#999;font-size:10px}
+.sw-player-time,.sw-player-progress{color:#fff;font-variant-numeric:tabular-nums}
+.sw-pdf-hidden{display:none!important}
+@media(min-width:700px){.sw-player-shell{height:auto;max-height:96vh;border-radius:16px}.sw-video-wrap{aspect-ratio:16/9;flex:0 1 auto}}
+</style>
+</head>
+<body>
+<div id="coursatk-server-page">
+  <div class="server-hero">
+    <div class="server-hero-card">
+      <div class="server-hero-title">Coursatk</div>
+      <div class="server-hero-sub">Server-side key unwrap • HLS • Railway</div>
+      <div class="server-hero-badge">AES-128 decrypted on server</div>
+      <br>
+      <button class="server-open" id="server-open">فتح لوحة كورساتك</button>
+    </div>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.15/dist/hls.min.js"></script>
+<script>
+(function(){
+  'use strict';
+  const CONFIG = { YEAR_ID: 4 };
+  const HISTORY_PREFIX = 'coursatk_watch_v6_';
+  const STATE = { view:'subjects', stack:[], cache:{}, ui:{visible:false}, player:null };
+
+  const $ = id => document.getElementById(id);
+  const el = (tag, cls, text) => { const e=document.createElement(tag); if(cls)e.className=cls; if(text!=null)e.textContent=text; return e; };
+  function formatDuration(s){ if(!s)return''; const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60); return h>0?\`\${h}:\${String(m).padStart(2,'0')}:\${String(sec).padStart(2,'0')}\`:\`\${m}:\${String(sec).padStart(2,'0')}\`; }
+  function haptic(ms=8){ try{navigator.vibrate&&navigator.vibrate(ms)}catch{} }
+  function historyKey(id){ return HISTORY_PREFIX+String(id); }
+  function getWatchState(id){ try{return JSON.parse(localStorage.getItem(historyKey(id))||'null')}catch{return null} }
+  function saveWatchState(id,st){ try{localStorage.setItem(historyKey(id),JSON.stringify({videoId:String(id),currentTime:+(st.currentTime||0),duration:+(st.duration||0),percent:+(st.percent||0),watched:!!st.watched,updatedAt:Date.now()}))}catch{} }
+
+  async function apiGet(path){
+    const res = await fetch(path,{headers:{Accept:'application/json'},credentials:'same-origin',cache:'no-store'});
+    let data; try{data=await res.json()}catch{throw new Error('رد غير صالح (HTTP '+res.status+')')}
+    if(!res.ok) throw new Error(data?.message||('HTTP '+res.status));
+    return data;
+  }
+
+  // ---- Player (plain key from server — no DecryptionUtils needed) ----
+  function destroyPlayer(){
+    const p=STATE.player; if(!p)return;
+    p.destroyed=true;
+    try{p.hls?.stopLoad()}catch{}
+    try{p.hls?.detachMedia()}catch{}
+    try{p.hls?.destroy()}catch{}
+    try{p.video?.pause()}catch{}
+    try{p.video?.removeAttribute('src')}catch{}
+    try{p.video?.load()}catch{}
+    try{p.overlay?.remove()}catch{}
+    STATE.player=null;
+  }
+
+  function createPlayerOverlay(videoId, title){
+    destroyPlayer();
+    const overlay=document.createElement('div');
+    overlay.id='sw-player-overlay';
+    overlay.innerHTML=\`
+      <div class="sw-player-shell">
+        <div class="sw-player-head">
+          <div class="sw-player-title"></div>
+          <button class="sw-player-close" type="button">✕</button>
+        </div>
+        <div class="sw-video-wrap">
+          <video class="sw-video" playsinline controls preload="none"></video>
+          <div class="sw-player-start">
+            <button class="sw-big-play" type="button"><span>▶</span></button>
+            <div class="sw-start-text">اضغط تشغيل لبدء جلب الفيديو</div>
+          </div>
+          <div class="sw-player-loading">
+            <div class="sw-spinner"></div>
+            <div class="sw-player-loading-text">جاري تجهيز الفيديو...</div>
+          </div>
+          <div class="sw-player-error"></div>
+        </div>
+        <div class="sw-player-info">
+          <span class="sw-player-status">في انتظار التشغيل</span>
+          <span class="sw-player-time">0:00 / --:--</span>
+          <span class="sw-player-progress">0%</span>
+        </div>
+      </div>\`;
+    document.body.appendChild(overlay);
+    const video=overlay.querySelector('.sw-video');
+    const titleEl=overlay.querySelector('.sw-player-title');
+    const startLayer=overlay.querySelector('.sw-player-start');
+    const bigPlay=overlay.querySelector('.sw-big-play');
+    const loading=overlay.querySelector('.sw-player-loading');
+    const loadingText=overlay.querySelector('.sw-player-loading-text');
+    const errorEl=overlay.querySelector('.sw-player-error');
+    const statusEl=overlay.querySelector('.sw-player-status');
+    const timeEl=overlay.querySelector('.sw-player-time');
+    const progressEl=overlay.querySelector('.sw-player-progress');
+    titleEl.textContent=title||'فيديو';
+    overlay.querySelector('.sw-player-close').onclick=destroyPlayer;
+    overlay.addEventListener('click',e=>{if(e.target===overlay)destroyPlayer()});
+
+    const player={videoId,title,overlay,video,startLayer,bigPlay,loading,loadingText,errorEl,statusEl,timeEl,progressEl,hls:null,destroyed:false,started:false,duration:0,lastSaved:0,savedState:getWatchState(videoId)};
+    STATE.player=player;
+
+    const start=()=>{if(player.destroyed||player.started)return;player.started=true;startLayer.style.display='none';startHLS(player)};
+    bigPlay.onclick=e=>{e.preventDefault();e.stopPropagation();haptic();start()};
+    video.addEventListener('play',()=>{if(!player.started)start();statusEl.textContent='يعمل'});
+    video.addEventListener('pause',()=>{if(!video.ended)statusEl.textContent='متوقف مؤقتًا'});
+    video.addEventListener('timeupdate',()=>{
+      if(player.destroyed)return;
+      const d=Number(video.duration),t=Number(video.currentTime)||0,real=Number.isFinite(d)&&d>0?d:player.duration;
+      const pct=real>0?Math.min(100,t/real*100):0;
+      timeEl.textContent=\`\${formatDuration(t)} / \${formatDuration(real)||'--:--'}\`;
+      progressEl.textContent=\`\${Math.round(pct)}%\`;
+      if(Date.now()-player.lastSaved>=1000){player.lastSaved=Date.now();saveWatchState(videoId,{currentTime:t,duration:real,percent:pct,watched:pct>=90});updateVideoCardProgress(videoId)}
+    });
+    video.addEventListener('durationchange',()=>{if(Number.isFinite(video.duration)&&video.duration>0){player.duration=video.duration}});
+    video.addEventListener('loadedmetadata',()=>{
+      if(player.savedState?.currentTime>0){try{const d=video.duration||player.duration;const r=Math.min(Number(player.savedState.currentTime),Math.max(0,d-.5));if(r>0)video.currentTime=r}catch{}}
+    });
+    video.addEventListener('ended',()=>{
+      const d=Number(video.duration)||player.duration||0;
+      saveWatchState(videoId,{currentTime:d,duration:d,percent:100,watched:true});
+      progressEl.textContent='100%';statusEl.textContent='تمت المشاهدة';updateVideoCardProgress(videoId);
+    });
+    video.addEventListener('error',()=>{if(!player.destroyed&&video.error)showErr(player,'الفيديو لم يُشغّل')});
+    return player;
+  }
+
+  function showLoad(p,m){p.loadingText.textContent=m||'جاري التحميل...';p.loading.style.display='flex'}
+  function hideLoad(p){p.loading.style.display='none'}
+  function showErr(p,m){p.errorEl.textContent=m||'خطأ';p.errorEl.style.display='block';p.loading.style.display='none';p.startLayer.style.display='flex';p.statusEl.textContent='خطأ في التشغيل'}
+
+  async function startHLS(player){
+    try{
+      showLoad(player,'جاري جلب بيانات التشغيل...');
+      const res=await fetch('/api/play/'+encodeURIComponent(player.videoId),{method:'POST',headers:{Accept:'application/json'},credentials:'same-origin',cache:'no-store'});
+      let data=null; try{data=await res.json()}catch{}
+      if(!res.ok) throw new Error(data?.message||('Playback HTTP '+res.status));
+      if(!data?.success||!data?.data?.manifest_url) throw new Error('بيانات التشغيل ناقصة');
+      const manifestUrl=location.origin+data.data.manifest_url;
+
+      if(!window.Hls||!Hls.isSupported()){
+        // Safari native HLS — key is already plain AES from our server
+        player.video.src=manifestUrl;
+        hideLoad(player);
+        try{await player.video.play()}catch{player.startLayer.style.display='flex'}
+        return;
+      }
+
+      showLoad(player,'جاري تجهيز المشغل...');
+      const hls=new Hls({
+        enableWorker:true,
+        lowLatencyMode:false,
+        maxBufferLength:18,
+        maxMaxBufferLength:18,
+        maxBufferSize:2*1024*1024,
+        backBufferLength:8,
+        capLevelToPlayerSize:true,
+        startPosition: player.savedState?.currentTime>0 ? Number(player.savedState.currentTime) : -1
+      });
+      player.hls=hls;
+      hls.on(Hls.Events.MANIFEST_PARSED, async()=>{
+        hideLoad(player);
+        player.statusEl.textContent='جاهز للتشغيل';
+        try{await player.video.play()}catch{player.startLayer.style.display='flex';player.statusEl.textContent='اضغط تشغيل'}
+      });
+      hls.on(Hls.Events.LEVEL_LOADED,(_,d)=>{
+        const dur=Number(d?.details?.totalduration);
+        if(dur>0){player.duration=dur;player.timeEl.textContent='0:00 / '+formatDuration(dur)}
+      });
+      hls.on(Hls.Events.ERROR,(_,d)=>{
+        if(!d?.fatal)return;
+        if(d.type===Hls.ErrorTypes.NETWORK_ERROR){player.statusEl.textContent='إعادة الاتصال...';try{hls.startLoad()}catch{};return}
+        if(d.type===Hls.ErrorTypes.MEDIA_ERROR){player.statusEl.textContent='إصلاح المسار...';try{hls.recoverMediaError()}catch{};return}
+        showErr(player,'HLS: '+(d.details||'فشل'));
+      });
+      hls.loadSource(manifestUrl);
+      hls.attachMedia(player.video);
+    }catch(e){
+      if(player.destroyed)return;
+      console.error(e);
+      showErr(player,e.message||'فشل التشغيل');
+    }
+  }
+
+  function updateVideoCardProgress(videoId){
+    const card=document.querySelector('[data-sw-video-id="'+CSS.escape(String(videoId))+'"]');
+    if(!card)return;
+    const state=getWatchState(videoId); if(!state)return;
+    const pct=Math.round(state.percent||0);
+    const chip=card.querySelector('.sw-watch-chip');
+    const btn=card.querySelector('.sw-video-action');
+    if(chip){chip.textContent=state.watched?'✓ تمت المشاهدة':pct+'%';chip.className='sw-chip sw-watch-chip '+(state.watched?'sw-chip-green':'sw-chip-orange')}
+    if(btn)btn.innerHTML=state.watched?'▶️ إعادة':(pct>0?'▶️ متابعة':'▶️ تشغيل');
+    if(state.watched||pct>0)card.classList.add('sw-card-accent');
+  }
+
+  // ---- UI ----
+  const UI={
+    panel:null, contentEl:null, breadcrumbEl:null, backBtn:null,
+    init(){ this.build(); this.updateBreadcrumb(); },
+    build(){
+      const old=$('sw-panel'); if(old)old.remove();
+      const ot=$('sw-toggle'); if(ot)ot.remove();
+      const toggle=el('button'); toggle.id='sw-toggle'; toggle.innerHTML='▶';
+      toggle.onclick=()=>UI.togglePanel(); document.body.appendChild(toggle);
+      const panel=el('div'); panel.id='sw-panel';
+      panel.innerHTML=\`
+        <div class="sw-handle" id="sw-handle"></div>
+        <div class="sw-header">
+          <button class="sw-icon-btn sw-hidden" id="sw-back">←</button>
+          <div class="sw-brand"><h3>Coursatk</h3><p>v6 • Server AES unwrap</p></div>
+          <button class="sw-close" id="sw-close">✕</button>
+        </div>
+        <div class="sw-breadcrumb" id="sw-breadcrumb"></div>
+        <div class="sw-content" id="sw-content"></div>\`;
+      document.body.appendChild(panel);
+      this.panel=panel; this.contentEl=$('sw-content'); this.breadcrumbEl=$('sw-breadcrumb'); this.backBtn=$('sw-back');
+      $('sw-close').onclick=()=>this.hidePanel();
+      this.backBtn.onclick=e=>{e.preventDefault();e.stopPropagation();haptic();this.goBack()};
+    },
+    togglePanel(){ haptic(); this.panel.classList.contains('sw-open')?this.hidePanel():this.showPanel(); },
+    showPanel(){ this.panel.classList.add('sw-open'); const t=$('sw-toggle'); if(t)t.classList.add('sw-active'); STATE.ui.visible=true;
+      if(!STATE.cache.subjects&&this.contentEl&&!this.contentEl.children.length) loadSubjects(); },
+    hidePanel(){ this.panel.classList.remove('sw-open'); const t=$('sw-toggle'); if(t)t.classList.remove('sw-active'); STATE.ui.visible=false; },
+    setContent(nodes){ if(!this.contentEl)return; this.contentEl.innerHTML=''; if(Array.isArray(nodes))nodes.forEach(n=>n&&this.contentEl.appendChild(n)); else if(nodes)this.contentEl.appendChild(nodes); },
+    showLoading(){ const f=document.createDocumentFragment(); for(let i=0;i<5;i++)f.appendChild(el('div','sw-skeleton')); this.setContent(f); },
+    showEmpty(icon,title,desc){ const w=el('div','sw-state'); w.innerHTML='<div class="sw-state-icon">'+icon+'</div><div class="sw-state-title">'+title+'</div>'+(desc?'<div class="sw-state-desc">'+desc+'</div>':''); this.setContent(w); },
+    showError(msg,retry){ const w=el('div','sw-state'); w.innerHTML='<div class="sw-state-icon">⚠️</div><div class="sw-state-title">حدث خطأ</div><div class="sw-state-desc">'+msg+'</div>'; if(retry){const b=el('button','sw-btn sw-btn-primary');b.textContent='🔄 إعادة';b.onclick=retry;w.appendChild(b)} this.setContent(w); },
+    sectionTitle(t){ return el('div','sw-section',t); },
+    card({icon,title,sub,chips,action,onClick,accent}){
+      const card=el('div','sw-card'+(accent?' sw-card-accent':''));
+      if(onClick)card.onclick=()=>{haptic();onClick()};
+      if(icon){const ic=el('div','sw-card-icon');ic.textContent=icon;card.appendChild(ic)}
+      const body=el('div','sw-card-body'); body.appendChild(el('div','sw-card-title',title));
+      if(sub||chips){const s=el('div','sw-card-sub'); if(sub)s.appendChild(el('span',null,sub)); if(chips)chips.forEach(c=>{const ch=el('span','sw-chip '+(c.cls||''));ch.textContent=c.text;s.appendChild(ch)}); body.appendChild(s)}
+      card.appendChild(body);
+      if(action){const b=el('button','sw-btn '+(action.cls||'sw-btn-primary'));b.innerHTML=action.label;b.onclick=e=>{e.stopPropagation();e.preventDefault();haptic();action.onClick(b)};card.appendChild(b)}
+      return card;
+    },
+    updateBreadcrumb(){
+      if(!this.breadcrumbEl)return; this.breadcrumbEl.innerHTML='';
+      const crumbs=[{label:'الرئيسية',index:0}]; STATE.stack.forEach((s,i)=>crumbs.push({label:s.label,index:i+1}));
+      crumbs.forEach((c,i)=>{ if(i>0)this.breadcrumbEl.appendChild(el('span','sw-sep','›')); const span=el('span'); span.textContent=c.label;
+        if(i===crumbs.length-1)span.className='sw-crumb-current'; else{span.className='sw-crumb-link';span.onclick=e=>{e.stopPropagation();haptic();this.goBackTo(c.index)}}
+        this.breadcrumbEl.appendChild(span);
+      });
+      if(this.backBtn){ STATE.stack.length?this.backBtn.classList.remove('sw-hidden'):this.backBtn.classList.add('sw-hidden'); }
+    },
+    pushStack(label,view){ STATE.stack.push({label,view,scrollTop:this.contentEl?this.contentEl.scrollTop:0}); this.updateBreadcrumb(); },
+    goBack(){ if(!STATE.stack.length){loadSubjects(true);return} STATE.stack.pop(); this.updateBreadcrumb(); const p=STATE.stack[STATE.stack.length-1]; p?this.navigateTo(p.view):loadSubjects(true); },
+    goBackTo(index){ if(index===0){STATE.stack=[];this.updateBreadcrumb();loadSubjects(true);return} STATE.stack=STATE.stack.slice(0,index); this.updateBreadcrumb(); const t=STATE.stack[STATE.stack.length-1]; t?this.navigateTo(t.view):loadSubjects(true); },
+    navigateTo(view){
+      if(view==='teachers'){const s=STATE.stack[0]?._ref; s?loadTeachers(s,false):loadSubjects(true)}
+      else if(view==='chapters'){const t=STATE.stack[1]?._ref; t?loadChapters(t,false):loadSubjects(true)}
+      else if(view==='lectures'){const c=STATE.stack[2]?._ref; c?loadLectures(c,false):loadSubjects(true)}
+      else if(view==='content'){const l=STATE.stack[3]?._ref; l?loadLectureContent(l,false):loadSubjects(true)}
+      else loadSubjects(true);
+    }
+  };
+
+  async function loadSubjects(skip){
+    if(!UI.contentEl){setTimeout(()=>loadSubjects(skip),300);return}
+    if(skip)STATE.stack=[]; STATE.view='subjects'; UI.updateBreadcrumb(); UI.showLoading();
+    try{ const res=await apiGet('/api/subjects/'+CONFIG.YEAR_ID); const subjects=res.data||[]; STATE.cache.subjects=subjects; renderSubjects(subjects); }
+    catch(e){ UI.showError(e.message,()=>loadSubjects(skip)); }
+  }
+  function renderSubjects(subjects){
+    if(!subjects.length){UI.showEmpty('📚','لا توجد مواد');return}
+    const f=document.createDocumentFragment(); f.appendChild(UI.sectionTitle('المواد • '+subjects.length));
+    subjects.forEach(s=>f.appendChild(UI.card({icon:'📘',title:s.name,chips:[{text:String(s.id),cls:'sw-chip-blue'}],onClick:()=>loadTeachers(s,true)})));
+    UI.setContent(f);
+  }
+  async function loadTeachers(subject,push=true){
+    if(push){UI.pushStack(subject.name,'teachers'); STATE.stack[STATE.stack.length-1]._ref=subject}
+    STATE.view='teachers'; UI.updateBreadcrumb(); UI.showLoading();
+    try{ const res=await apiGet('/api/subjects/'+subject.id+'/teachers'); const teachers=res.data?.teachers||res.data||[]; renderTeachers(teachers,subject); }
+    catch(e){ UI.showError(e.message,()=>loadTeachers(subject,push)); }
+  }
+  function renderTeachers(teachers,subject){
+    if(!teachers.length){UI.showEmpty('👨‍🏫','لا يوجد مدرسين');return}
+    const f=document.createDocumentFragment(); f.appendChild(UI.sectionTitle('مدرسين '+subject.name+' • '+teachers.length));
+    teachers.forEach(t=>f.appendChild(UI.card({icon:'👨‍🏫',title:t.name,chips:[{text:(t.chapter_count||0)+' شابتر',cls:'sw-chip-green'}],onClick:()=>loadChapters(t,true)})));
+    UI.setContent(f);
+  }
+  async function loadChapters(teacher,push=true){
+    if(push){UI.pushStack(teacher.name,'chapters'); STATE.stack[STATE.stack.length-1]._ref=teacher}
+    STATE.view='chapters'; UI.updateBreadcrumb(); UI.showLoading();
+    try{ const res=await apiGet('/api/teachers/'+teacher.id+'/chapters'); renderChapters(res.data||[],teacher); }
+    catch(e){ UI.showError(e.message,()=>loadChapters(teacher,push)); }
+  }
+  function renderChapters(chapters,teacher){
+    if(!chapters.length){UI.showEmpty('📖','لا يوجد شباتر');return}
+    const f=document.createDocumentFragment(); f.appendChild(UI.sectionTitle('شباتر '+teacher.name+' • '+chapters.length));
+    chapters.forEach(c=>f.appendChild(UI.card({icon:'📖',title:c.name,chips:[{text:(c.lecture_count||0)+' محاضرة',cls:'sw-chip-green'}],onClick:()=>loadLectures(c,true)})));
+    UI.setContent(f);
+  }
+  async function loadLectures(chapter,push=true){
+    if(push){UI.pushStack(chapter.name,'lectures'); STATE.stack[STATE.stack.length-1]._ref=chapter}
+    STATE.view='lectures'; UI.updateBreadcrumb(); UI.showLoading();
+    try{ const res=await apiGet('/api/chapters/'+chapter.id+'/lectures'); renderLectures(res.data||[],chapter); }
+    catch(e){ UI.showError(e.message,()=>loadLectures(chapter,push)); }
+  }
+  function renderLectures(lectures,chapter){
+    if(!lectures.length){UI.showEmpty('🎓','لا يوجد محاضرات');return}
+    const f=document.createDocumentFragment(); f.appendChild(UI.sectionTitle('محاضرات • '+lectures.length));
+    lectures.forEach(l=>f.appendChild(UI.card({icon:'🎓',title:l.name,onClick:()=>loadLectureContent(l,true)})));
+    UI.setContent(f);
+  }
+  async function loadLectureContent(lecture,push=true){
+    if(push){UI.pushStack(lecture.name,'content'); STATE.stack[STATE.stack.length-1]._ref=lecture}
+    STATE.view='content'; UI.updateBreadcrumb(); UI.showLoading();
+    try{ const res=await apiGet('/api/lectures/'+lecture.id+'/content'); const d=res.data||{}; renderContent({videos:d.videos||[],pdfs:d.pdfs||[],exams:d.exams||[]},lecture); }
+    catch(e){ UI.showError(e.message,()=>loadLectureContent(lecture,push)); }
+  }
+  function renderContent(content,lecture){
+    const f=document.createDocumentFragment();
+    if(content.videos.length){
+      f.appendChild(UI.sectionTitle('🎬 فيديوهات • '+content.videos.length));
+      content.videos.forEach(v=>{
+        const state=getWatchState(v.id); const pct=Math.round(state?.percent||0);
+        const chips=[];
+        if(v.duration||v.duration_seconds) chips.push({text:formatDuration(Number(v.duration||v.duration_seconds)),cls:'sw-chip-blue'});
+        if(state?.watched) chips.push({text:'✓ تمت المشاهدة',cls:'sw-chip-green'});
+        else if(pct>0) chips.push({text:pct+'%',cls:'sw-chip-orange'});
+        else chips.push({text:'لم تبدأ',cls:''});
+        const card=UI.card({
+          icon:'▶', title:v.title, chips,
+          action:{ label:state?.watched?'▶️ إعادة':(pct>0?'▶️ متابعة':'▶️ تشغيل'), cls:'sw-btn-primary sw-video-action',
+            onClick:async btn=>{ btn.disabled=true; try{createPlayerOverlay(v.id,v.title)} finally{setTimeout(()=>btn.disabled=false,500)} }
+          }
+        });
+        card.dataset.swVideoId=String(v.id);
+        const wc=card.querySelector('.sw-chip-orange,.sw-chip-green,.sw-chip:not(.sw-chip-blue)');
+        if(wc)wc.classList.add('sw-watch-chip');
+        if(pct>0||state?.watched)card.classList.add('sw-card-accent');
+        f.appendChild(card);
+      });
+    }
+    if(content.pdfs?.length){
+      const toggle=UI.card({icon:'▣',title:'الملفات PDF • '+content.pdfs.length,sub:'اضغط لإظهار',action:{label:'إظهار',cls:'sw-btn-secondary',onClick:btn=>{
+        const sec=btn.closest('.sw-card')?.nextElementSibling;
+        if(sec?.classList.contains('sw-pdf-list')){sec.classList.toggle('sw-pdf-hidden');btn.textContent=sec.classList.contains('sw-pdf-hidden')?'إظهار':'إخفاء'}
+      }}});
+      f.appendChild(toggle);
+      const list=el('div','sw-pdf-list sw-pdf-hidden');
+      content.pdfs.forEach(p=>list.appendChild(UI.card({icon:'▣',title:p.title,action:{label:'فتح',cls:'sw-btn-secondary',onClick:()=>window.open(p.url,'_blank')}})));
+      f.appendChild(list);
+    }
+    if(content.exams?.length){
+      f.appendChild(UI.sectionTitle('📝 امتحانات • '+content.exams.length));
+      content.exams.forEach(e=>f.appendChild(UI.card({icon:'📝',title:e.title,chips:[{text:(e.question_count||0)+' سؤال',cls:'sw-chip-orange'},{text:(e.duration_minutes||0)+' د',cls:'sw-chip-blue'}]})));
+    }
+    if(!content.videos.length&&!content.pdfs?.length&&!content.exams?.length){UI.showEmpty('📭','لا يوجد محتوى');return}
+    UI.setContent(f);
+  }
+
+  function init(){
+    UI.init();
+    const b=$('server-open'); if(b)b.onclick=()=>UI.showPanel();
+    setTimeout(()=>loadSubjects().catch(()=>{}),400);
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init); else init();
+})();
+</script>
+</body>
+</html>`;
 
 app.get("/", (_req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8");
   res.send(INDEX_HTML);
 });
 
-app.use("/api", (_req, res) => {
-  return jsonError(res, 404, "API route غير موجود");
-});
+app.use("/api", (_req, res) => jsonError(res, 404, "API route غير موجود"));
 
 app.get("*", (_req, res) => {
   res.set("Content-Type", "text/html; charset=utf-8");
   res.send(INDEX_HTML);
 });
 
+// Boot
+await loadDecryptionUtils();
 app.listen(PORT, () => {
-  console.log(`[Coursatk] listening on :${PORT}`);
+  console.log(`[Coursatk] listening on :${PORT} (server-side AES unwrap)`);
 });
