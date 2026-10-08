@@ -35,12 +35,23 @@ function jsonError(res, status, message) {
   return res.status(status).json({ success: false, message });
 }
 
-function allowedStreamUrl(raw) {
+function allowedStreamUrl(raw, session = null) {
   try {
     const u = new URL(raw);
-    return u.protocol === "https:" && STREAM_HOSTS.some(h =>
+    if (u.protocol !== "https:") return false;
+
+    // Allow the CDN hostname returned by the authenticated playback session.
+    // This avoids breaking when the stream provider rotates CDN hostnames.
+    const sessionHost = session?.streamUrl
+      ? new URL(session.streamUrl).hostname
+      : "";
+
+    return STREAM_HOSTS.some(h =>
       u.hostname === h || u.hostname.endsWith("." + h)
-    );
+    ) || (sessionHost && (
+      u.hostname === sessionHost ||
+      u.hostname.endsWith("." + sessionHost)
+    ));
   } catch {
     return false;
   }
@@ -93,7 +104,7 @@ function getSession(id) {
 }
 
 async function streamFetch(session, url, extra = {}) {
-  if (!allowedStreamUrl(url)) throw new Error("Stream URL غير مسموح");
+  if (!allowedStreamUrl(url, session)) throw new Error("Stream URL غير مسموح");
   return fetch(url, {
     headers: {
       Authorization: `Bearer ${session.token}`,
