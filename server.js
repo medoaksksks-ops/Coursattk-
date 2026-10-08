@@ -108,10 +108,16 @@ function getSession(id) {
 }
 
 async function streamFetch(session, url, extra = {}) {
-  if (!allowedStreamUrl(url, session)) throw new Error("Stream URL غير مسموح");
+  if (!allowedStreamUrl(url, session)) {
+    throw new Error(`Stream URL غير مسموح: ${url}`);
+  }
+
+  // Match the userscript player request shape: Bearer playback token,
+  // no-cache, and no extra authentication scheme. Preserve Range for HLS.
   return fetch(url, {
     headers: {
       Authorization: `Bearer ${session.token}`,
+      Accept: "*/*",
       "Cache-Control": "no-cache",
       ...extra
     }
@@ -264,6 +270,7 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res) {
       const uri = line.match(/URI="([^"]+)"/)?.[1];
       if (uri) {
         session.keyUrl = absoluteUrl(uri, baseUrl);
+        try { session.allowedHosts.add(new URL(session.keyUrl).hostname); } catch {}
         const keyRes = await streamFetch(session, session.keyUrl);
         if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
         session.wrappedKey = Buffer.from(await keyRes.arrayBuffer());
@@ -279,6 +286,12 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res) {
 
     if (line && !line.startsWith("#")) {
       const segmentUrl = absoluteUrl(line, baseUrl);
+
+      // IMPORTANT: the original player can receive segments from a CDN host
+      // different from the master/variant host. Register that exact host in
+      // the current playback session before the browser requests the proxy URL.
+      try { session.allowedHosts.add(new URL(segmentUrl).hostname); } catch {}
+
       const encoded = Buffer.from(segmentUrl, "utf8").toString("base64url");
       out.push(`/api/stream/segment/${sessionId}/${encoded}`);
       continue;
