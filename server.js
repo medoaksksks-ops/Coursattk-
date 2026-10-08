@@ -114,6 +114,16 @@ app.get("/api/subjects", async (_req, res) => {
   catch (e) { jsonError(res, 502, e.message); }
 });
 
+// Accept the frontend's year-specific route too: /api/subjects/4
+app.get("/api/subjects/:id", async (req, res) => {
+  try {
+    const id = encodeURIComponent(req.params.id);
+    res.json(await upstreamJson(`/user/subjects/${id}`));
+  } catch (e) {
+    jsonError(res, 502, e.message);
+  }
+});
+
 app.get("/api/subjects/:id/teachers", async (req, res) => {
   try { res.json(await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}/teachers`)); }
   catch (e) { jsonError(res, 502, e.message); }
