@@ -239,7 +239,10 @@ function jsonError(res, status, message) {
 function getBearer(req) {
   const h = req.headers.authorization || "";
   if (h.startsWith("Bearer ")) return h.slice(7).trim();
-  return req.headers["x-session-token"] || req.query.token || "";
+  const xt = req.headers["x-session-token"];
+  if (xt) return String(xt).trim();
+  if (req.query && req.query.token) return String(req.query.token).trim();
+  return "";
 }
 
 // ── Student auth middleware ──
@@ -687,13 +690,58 @@ app.get("/api/config", requireStudent, async (req, res) => {
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
     const data = await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}`);
-    // Filter by section subjectIds if configured
-    let list = data.data || [];
+    let list = Array.isArray(data.data) ? data.data.slice() : [];
+
+    // Section subject IDs (e.g. literary includes 62,63,64 beyond year list)
+    let wantedIds = [];
     if (req.student.section) {
       const sec = await fbGet(`sections/${req.student.section}`);
-      const ids = (sec?.subjectIds || []).map(String);
-      if (ids.length) list = list.filter((s) => ids.includes(String(s.id)));
+      wantedIds = (sec?.subjectIds || []).map(Number).filter((n) => !Number.isNaN(n));
     }
+
+    if (wantedIds.length) {
+      const have = new Set(list.map((s) => Number(s.id)));
+      const missing = wantedIds.filter((id) => !have.has(id));
+
+      // Extra upstream fetches for IDs not in the year list
+      for (const mid of missing) {
+        try {
+          const one = await upstreamJson(`/user/subjects/${mid}`);
+          // Response may be a list or a single object
+          if (Array.isArray(one?.data)) {
+            for (const s of one.data) {
+              if (Number(s.id) === mid) {
+                list.push(s);
+                have.add(mid);
+                break;
+              }
+            }
+            // some APIs return the subject as the only element under data
+            if (!have.has(mid) && one.data.length === 1 && one.data[0]) {
+              const s = one.data[0];
+              if (!s.id) s.id = mid;
+              list.push(s);
+              have.add(mid);
+            }
+          } else if (one?.data && typeof one.data === "object") {
+            const s = one.data;
+            if (!s.id) s.id = mid;
+            list.push(s);
+            have.add(mid);
+          } else if (one && one.id) {
+            list.push(one);
+            have.add(mid);
+          }
+        } catch (err) {
+          console.warn(`[subjects] extra fetch ${mid} failed:`, err.message);
+        }
+      }
+
+      // Keep only wanted IDs, stable order as configured on section
+      const byId = new Map(list.map((s) => [Number(s.id), s]));
+      list = wantedIds.map((id) => byId.get(id)).filter(Boolean);
+    }
+
     res.json({ ...data, data: list });
   } catch (e) {
     jsonError(res, 502, e.message);
@@ -1447,22 +1495,15 @@ try {
       updatedAt: Date.now()
     }
   };
-  const secs = (await fbGet("sections")) || {};
-  let changed = false;
+  // Force-write canonical subject IDs every boot
   for (const [id, def] of Object.entries(sectionDefaults)) {
-    const cur = secs[id];
-    const same =
-      cur &&
-      Array.isArray(cur.subjectIds) &&
-      cur.subjectIds.length === def.subjectIds.length &&
-      def.subjectIds.every((x, i) => Number(cur.subjectIds[i]) === x);
-    if (!same) {
-      await fbSet(`sections/${id}`, { ...(cur || {}), ...def });
-      changed = true;
-    }
+    await fbSet(`sections/${id}`, def);
   }
-  if (changed) console.log("[API] sections subjectIds synced");
-  else console.log("[API] sections OK");
+  console.log("[API] sections subjectIds force-synced:", {
+    scientific_sciences: [57, 58, 59, 60, 61],
+    scientific_math: [57, 58, 59, 60, 65],
+    literary: [57, 58, 62, 63, 64]
+  });
 } catch (e) {
   console.warn("[API] section seed skip:", e.message);
 }
