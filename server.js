@@ -689,60 +689,77 @@ app.get("/api/config", requireStudent, async (req, res) => {
 
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
-    const data = await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}`);
-    let list = Array.isArray(data.data) ? data.data.slice() : [];
-
-    // Section subject IDs (e.g. literary includes 62,63,64 beyond year list)
+    // 1) Load section subject IDs (fixed catalog per شعبة)
     let wantedIds = [];
+    let yearId = Number(req.params.id) || CONFIG.DEFAULT_YEAR_ID;
     if (req.student.section) {
       const sec = await fbGet(`sections/${req.student.section}`);
-      wantedIds = (sec?.subjectIds || []).map(Number).filter((n) => !Number.isNaN(n));
-    }
-
-    if (wantedIds.length) {
-      const have = new Set(list.map((s) => Number(s.id)));
-      const missing = wantedIds.filter((id) => !have.has(id));
-
-      // Extra upstream fetches for IDs not in the year list
-      for (const mid of missing) {
-        try {
-          const one = await upstreamJson(`/user/subjects/${mid}`);
-          // Response may be a list or a single object
-          if (Array.isArray(one?.data)) {
-            for (const s of one.data) {
-              if (Number(s.id) === mid) {
-                list.push(s);
-                have.add(mid);
-                break;
-              }
-            }
-            // some APIs return the subject as the only element under data
-            if (!have.has(mid) && one.data.length === 1 && one.data[0]) {
-              const s = one.data[0];
-              if (!s.id) s.id = mid;
-              list.push(s);
-              have.add(mid);
-            }
-          } else if (one?.data && typeof one.data === "object") {
-            const s = one.data;
-            if (!s.id) s.id = mid;
-            list.push(s);
-            have.add(mid);
-          } else if (one && one.id) {
-            list.push(one);
-            have.add(mid);
-          }
-        } catch (err) {
-          console.warn(`[subjects] extra fetch ${mid} failed:`, err.message);
+      if (sec) {
+        if (Array.isArray(sec.subjectIds) && sec.subjectIds.length) {
+          wantedIds = sec.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
         }
+        if (sec.yearId) yearId = Number(sec.yearId) || yearId;
       }
-
-      // Keep only wanted IDs, stable order as configured on section
-      const byId = new Map(list.map((s) => [Number(s.id), s]));
-      list = wantedIds.map((id) => byId.get(id)).filter(Boolean);
     }
 
-    res.json({ ...data, data: list });
+    // 2) Fetch year subjects once (upstream list)
+    const yearData = await upstreamJson(`/user/subjects/${encodeURIComponent(yearId)}`);
+    let yearList = Array.isArray(yearData.data) ? yearData.data : [];
+    const byId = new Map(yearList.map((s) => [Number(s.id), s]));
+
+    // 3) If no section filter → return full year list
+    if (!wantedIds.length) {
+      return res.json({ ...yearData, data: yearList });
+    }
+
+    // 4) For each fixed ID: use year list, otherwise fetch via /teachers
+    //    (coursatk returns subject name+image on teachers endpoint)
+    const results = [];
+    for (const sid of wantedIds) {
+      if (byId.has(sid)) {
+        results.push(byId.get(sid));
+        continue;
+      }
+      try {
+        const t = await upstreamJson(`/user/subjects/${sid}/teachers`);
+        const d = t?.data;
+        if (d && (d.id || d.name)) {
+          results.push({
+            id: Number(d.id) || sid,
+            name: d.name || `مادة ${sid}`,
+            image_url: d.image_url || null,
+            year_id: yearId,
+            is_published: true,
+            order_index: results.length + 1
+          });
+        } else {
+          results.push({
+            id: sid,
+            name: `مادة ${sid}`,
+            image_url: null,
+            year_id: yearId,
+            is_published: true,
+            order_index: results.length + 1
+          });
+        }
+      } catch (err) {
+        console.warn(`[subjects] resolve ${sid}:`, err.message);
+        results.push({
+          id: sid,
+          name: `مادة ${sid}`,
+          image_url: null,
+          year_id: yearId,
+          is_published: true,
+          order_index: results.length + 1
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Success",
+      data: results
+    });
   } catch (e) {
     jsonError(res, 502, e.message);
   }
