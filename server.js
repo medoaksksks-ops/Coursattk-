@@ -1423,16 +1423,46 @@ await loadDecryptionUtils();
 
 // Seed default sections if missing
 try {
-  const secs = await fbGet("sections");
-  if (!secs || !Object.keys(secs).length) {
-    const defaults = {
-      scientific_sciences: { name: "علمي علوم", yearId: 4, subjectIds: [], updatedAt: Date.now() },
-      scientific_math: { name: "علمي رياضة", yearId: 4, subjectIds: [], updatedAt: Date.now() },
-      literary: { name: "أدبي", yearId: 4, subjectIds: [], updatedAt: Date.now() }
-    };
-    await fbSet("sections", defaults);
-    console.log("[API] seeded default sections");
+  // Always ensure correct subject IDs for the 3 main sections
+  // علمي علوم: 57 عربي، 58 English، 59 فيزياء، 60 كيمياء، 61 أحياء
+  // علمي رياضة: نفس علوم مع 65 رياضة بدل 61 أحياء
+  // أدبي: 57 عربي، 58 English + 62،63،64
+  const sectionDefaults = {
+    scientific_sciences: {
+      name: "علمي علوم",
+      yearId: 4,
+      subjectIds: [57, 58, 59, 60, 61],
+      updatedAt: Date.now()
+    },
+    scientific_math: {
+      name: "علمي رياضة",
+      yearId: 4,
+      subjectIds: [57, 58, 59, 60, 65],
+      updatedAt: Date.now()
+    },
+    literary: {
+      name: "أدبي",
+      yearId: 4,
+      subjectIds: [57, 58, 62, 63, 64],
+      updatedAt: Date.now()
+    }
+  };
+  const secs = (await fbGet("sections")) || {};
+  let changed = false;
+  for (const [id, def] of Object.entries(sectionDefaults)) {
+    const cur = secs[id];
+    const same =
+      cur &&
+      Array.isArray(cur.subjectIds) &&
+      cur.subjectIds.length === def.subjectIds.length &&
+      def.subjectIds.every((x, i) => Number(cur.subjectIds[i]) === x);
+    if (!same) {
+      await fbSet(`sections/${id}`, { ...(cur || {}), ...def });
+      changed = true;
+    }
   }
+  if (changed) console.log("[API] sections subjectIds synced");
+  else console.log("[API] sections OK");
 } catch (e) {
   console.warn("[API] section seed skip:", e.message);
 }
