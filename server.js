@@ -22,6 +22,50 @@ app.use(express.json({ limit: "512kb" }));
 app.use(compression());
 
 // ═══════════════════════════════════════════════════════════
+// Rate limit — ~50 req / minute / IP (stricter on auth)
+// ═══════════════════════════════════════════════════════════
+const rateBuckets = new Map();
+
+function clientIp(req) {
+  const xf = (req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return xf || req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+function rateLimit(options = {}) {
+  const windowMs = options.windowMs || 60_000;
+  const max = options.max || 50;
+  const keyFn = options.keyFn || ((req) => clientIp(req) + ":" + (options.scope || "global"));
+  return (req, res, next) => {
+    const key = keyFn(req);
+    const now = Date.now();
+    let b = rateBuckets.get(key);
+    if (!b || now > b.resetAt) {
+      b = { count: 0, resetAt: now + windowMs };
+      rateBuckets.set(key, b);
+    }
+    b.count += 1;
+    res.setHeader("X-RateLimit-Limit", String(max));
+    res.setHeader("X-RateLimit-Remaining", String(Math.max(0, max - b.count)));
+    if (b.count > max) {
+      return res.status(429).json({
+        success: false,
+        message: "طلبات كثيرة — حاول بعد دقيقة"
+      });
+    }
+    next();
+  };
+}
+
+setInterval(() => {
+  const t = Date.now();
+  for (const [k, b] of rateBuckets) {
+    if (t > b.resetAt) rateBuckets.delete(k);
+  }
+}, 60_000).unref();
+
+
+
+// ═══════════════════════════════════════════════════════════
 // CONFIG (in-code — no Railway vars required for core secrets)
 // ═══════════════════════════════════════════════════════════
 const CONFIG = {
@@ -47,12 +91,10 @@ const CONFIG = {
   FIREBASE: "https://english-73376-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
   BOOTSTRAP_ADMIN: {
-    username: "admin",
-    // password: Admin@123 — change after first login via API
-    passwordHash:
-      "scrypt$16384$8$1$a1b2c3d4e5f60718$8f3c2e1d0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2",
-    // Will be replaced at boot with real hash of Admin@123
-    passwordPlain: "Admin@123",
+    username: "Hema",
+    // password set below — hashed at boot
+    passwordHash: "",
+    passwordPlain: "ibrahim@2009*#",
     permissions: {
       students_create: true,
       students_edit: true,
@@ -428,6 +470,8 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
 // ═══════════════════════════════════════════════════════════
 // PUBLIC (no auth)
 // ═══════════════════════════════════════════════════════════
+app.use(rateLimit({ max: 50, windowMs: 60_000, scope: "global" }));
+
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -453,7 +497,7 @@ app.get("/api/public/code-types", (_req, res) => {
  * POST /api/auth/login
  * body: { code: "1234567", deviceId: "uuid", deviceName?: "Chrome" }
  */
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", rateLimit({ max: 15, windowMs: 60_000, scope: "login" }), async (req, res) => {
   try {
     const code = String(req.body?.code || "").trim();
     const deviceId = String(req.body?.deviceId || "").trim();
@@ -864,7 +908,7 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
 // ═══════════════════════════════════════════════════════════
 // ADMIN AUTH
 // ═══════════════════════════════════════════════════════════
-app.post("/api/admin/login", async (req, res) => {
+app.post("/api/admin/login", rateLimit({ max: 10, windowMs: 60_000, scope: "admin-login" }), async (req, res) => {
   try {
     const username = String(req.body?.username || "").trim();
     const password = String(req.body?.password || "");
@@ -1274,8 +1318,20 @@ app.delete("/api/admin/admins/:id", requireAdmin("admins_manage"), async (req, r
 // ═══════════════════════════════════════════════════════════
 // Fallback
 // ═══════════════════════════════════════════════════════════
+// Root / unknown — require client handshake (no API dump)
+app.get("/", (_req, res) => {
+  res.status(403).json({
+    success: false,
+    message: "خطأ: يلزم مصادقة. الوصول المباشر غير مسموح."
+  });
+});
+
 app.use((req, res) => {
-  jsonError(res, 404, `Not found: ${req.method} ${req.path}`);
+  res.status(403).json({
+    success: false,
+    message: "خطأ: يلزم مصادقة أو المسار غير موجود.",
+    path: req.path
+  });
 });
 
 // Cleanup timers
@@ -1297,5 +1353,5 @@ CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.password
 await loadDecryptionUtils();
 app.listen(CONFIG.PORT, () => {
   console.log(`[API] :${CONFIG.PORT} protected · segment-decrypt ON`);
-  console.log(`[API] bootstrap admin → user: admin  pass: Admin@123  (change it!)`);
+  console.log(`[API] bootstrap admin ready (Hema)`);
 });
