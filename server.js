@@ -193,11 +193,37 @@ async function fbPatch(p, data) {
   return r.json();
 }
 
+
 async function fbDelete(p) {
   const r = await fetch(`${CONFIG.FIREBASE}/${p}.json`, { method: "DELETE" });
   if (!r.ok) throw new Error(`Firebase DELETE ${p} → ${r.status}`);
   return true;
 }
+
+// Runtime config from Firebase (overrides in-code defaults)
+let cachedCoursatkToken = null;
+let cachedTokenAt = 0;
+async function getCoursatkToken() {
+  const ttl = 30_000;
+  if (cachedCoursatkToken && Date.now() - cachedTokenAt < ttl) return cachedCoursatkToken;
+  try {
+    const remote = await fbGet("config/coursatkToken");
+    if (remote && typeof remote === "string" && remote.length > 20) {
+      cachedCoursatkToken = remote;
+      cachedTokenAt = Date.now();
+      return remote;
+    }
+    if (remote && remote.token) {
+      cachedCoursatkToken = remote.token;
+      cachedTokenAt = Date.now();
+      return remote.token;
+    }
+  } catch {}
+  cachedCoursatkToken = CONFIG.COURSATK_TOKEN;
+  cachedTokenAt = Date.now();
+  return CONFIG.COURSATK_TOKEN;
+}
+
 
 // ═══════════════════════════════════════════════════════════
 // In-memory session caches (source of truth also in Firebase)
@@ -406,9 +432,10 @@ function ivFromMediaSequence(seq) {
 }
 
 // Upstream helpers (token never exposed)
-function upstreamHeaders(extra = {}) {
+async function upstreamHeaders(extra = {}) {
+  const tok = await getCoursatkToken();
   return {
-    Authorization: `Bearer ${CONFIG.COURSATK_TOKEN}`,
+    Authorization: `Bearer ${tok}`,
     Accept: "application/json",
     ...extra
   };
@@ -417,7 +444,7 @@ function upstreamHeaders(extra = {}) {
 async function upstreamJson(apiPath, options = {}) {
   const r = await fetch(`${CONFIG.COURSATK_API}${apiPath}`, {
     ...options,
-    headers: upstreamHeaders(options.headers || {})
+    headers: await upstreamHeaders(options.headers || {})
   });
   const text = await r.text();
   let data;
@@ -984,6 +1011,48 @@ app.get("/api/admin/me", requireAdmin(null), (req, res) => {
   });
 });
 
+
+// ═══════════════════════════════════════════════════════════
+// ADMIN — App config (Coursatk token)
+// ═══════════════════════════════════════════════════════════
+app.get("/api/admin/config", requireAdmin("sections_manage"), async (_req, res) => {
+  try {
+    const remote = await fbGet("config");
+    const token = await getCoursatkToken();
+    const masked = token
+      ? token.slice(0, 12) + "…" + token.slice(-8)
+      : null;
+    res.json({
+      success: true,
+      data: {
+        coursatkTokenSet: Boolean(token),
+        coursatkTokenMasked: masked,
+        defaultYearId: CONFIG.DEFAULT_YEAR_ID,
+        codeTypes: Object.fromEntries(
+          Object.entries(CONFIG.CODE_TYPES).map(([k, v]) => [k, { label: v.label, ms: v.ms }])
+        ),
+        firebase: remote || {}
+      }
+    });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** PUT /api/admin/config/token  { token: "eyJ..." } */
+app.put("/api/admin/config/token", requireAdmin("admins_manage"), async (req, res) => {
+  try {
+    const token = String(req.body?.token || "").trim();
+    if (token.length < 20) return jsonError(res, 400, "توكن غير صالح");
+    await fbSet("config/coursatkToken", token);
+    cachedCoursatkToken = token;
+    cachedTokenAt = Date.now();
+    res.json({ success: true, message: "تم تحديث توكن كورساتك" });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
 // ═══════════════════════════════════════════════════════════
 // ADMIN — Students
 // ═══════════════════════════════════════════════════════════
@@ -1351,6 +1420,23 @@ setInterval(() => {
 // Boot: hash bootstrap password properly + load crypto
 CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
 await loadDecryptionUtils();
+
+// Seed default sections if missing
+try {
+  const secs = await fbGet("sections");
+  if (!secs || !Object.keys(secs).length) {
+    const defaults = {
+      scientific_sciences: { name: "علمي علوم", yearId: 4, subjectIds: [], updatedAt: Date.now() },
+      scientific_math: { name: "علمي رياضة", yearId: 4, subjectIds: [], updatedAt: Date.now() },
+      literary: { name: "أدبي", yearId: 4, subjectIds: [], updatedAt: Date.now() }
+    };
+    await fbSet("sections", defaults);
+    console.log("[API] seeded default sections");
+  }
+} catch (e) {
+  console.warn("[API] section seed skip:", e.message);
+}
+
 app.listen(CONFIG.PORT, () => {
   console.log(`[API] :${CONFIG.PORT} protected · segment-decrypt ON`);
   console.log(`[API] bootstrap admin ready (Hema)`);
