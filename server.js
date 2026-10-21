@@ -245,6 +245,31 @@ function getBearer(req) {
   return "";
 }
 
+// ── Student record cache (30s) + retry — avoids Firebase 500s under segment bursts ──
+const studentCache = new Map();
+async function getStudentCached(code) {
+  const c = studentCache.get(code);
+  if (c && Date.now() - c.at < 30_000) return c.student;
+  let student;
+  try {
+    student = await fbGet(`students/${code}`);
+  } catch {
+    await new Promise((r) => setTimeout(r, 300));
+    try {
+      student = await fbGet(`students/${code}`);
+    } catch (e) {
+      if (c) return c.student; // serve stale rather than fail playback
+      throw e;
+    }
+  }
+  studentCache.set(code, { student, at: Date.now() });
+  return student;
+}
+setInterval(() => {
+  const t = Date.now();
+  for (const [k, c] of studentCache) if (t - c.at > 120_000) studentCache.delete(k);
+}, 60_000).unref();
+
 // ── Student auth middleware ──
 async function requireStudent(req, res, next) {
   try {
@@ -266,7 +291,7 @@ async function requireStudent(req, res, next) {
     }
 
     // Validate student still exists & active & not expired
-    const student = await fbGet(`students/${sess.code}`);
+    const student = await getStudentCached(sess.code);
     if (!student || student.active === false) {
       studentSessions.delete(token);
       return jsonError(res, 401, "الحساب غير موجود أو موقوف");
@@ -279,6 +304,7 @@ async function requireStudent(req, res, next) {
     const devices = student.devices || {};
     if (sess.deviceId && !devices[sess.deviceId]) {
       studentSessions.delete(token);
+      studentCache.delete(sess.code);
       try { await fbDelete(`sessions/${token}`); } catch {}
       return jsonError(res, 401, "تم تسجيل خروج هذا الجهاز من لوحة التحكم");
     }
@@ -500,7 +526,10 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
 // ═══════════════════════════════════════════════════════════
 // PUBLIC (no auth)
 // ═══════════════════════════════════════════════════════════
-app.use(rateLimit({ max: 50, windowMs: 60_000, scope: "global" }));
+const globalLimiter = rateLimit({ max: 50, windowMs: 60_000, scope: "global" });
+app.use((req, res, next) =>
+  req.path.startsWith("/api/stream/") ? next() : globalLimiter(req, res, next)
+);
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -823,7 +852,9 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       videoId: String(data.data.video_id),
       token: data.data.token,
       streamUrl: data.data.stream_url,
+      playId: String(req.params.videoId),
       createdAt: now(),
+      lastUsed: now(),
       plainKey: null,
       defaultIv: null,
       allowedHosts: new Set([new URL(data.data.stream_url).hostname]),
@@ -845,11 +876,29 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
 function getStreamSession(id) {
   const s = streamSessions.get(id);
   if (!s) return null;
-  if (now() - s.createdAt > CONFIG.STREAM_SESSION_MS) {
+  const last = s.lastUsed || s.createdAt;
+  if (now() - last > CONFIG.STREAM_SESSION_MS) {
     streamSessions.delete(id);
     return null;
   }
+  s.lastUsed = now();
   return s;
+}
+
+// Re-issue playback token when upstream returns 401 on the master playlist
+async function refreshPlayback(session) {
+  const data = await upstreamJson(
+    `/video/${encodeURIComponent(session.playId)}/stream-weave/play`,
+    { method: "POST", headers: { Accept: "application/json" } }
+  );
+  if (!data?.success || !data?.data?.token || !data?.data?.stream_url) {
+    throw new Error("فشل تجديد التوكن");
+  }
+  session.token = data.data.token;
+  session.streamUrl = data.data.stream_url;
+  try { session.allowedHosts.add(new URL(session.streamUrl).hostname); } catch {}
+  session.lastUsed = now();
+  console.log(`[refresh] playback token renewed for ${session.videoId}`);
 }
 
 app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
@@ -860,7 +909,11 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
   }
 
   try {
-    const master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    let master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    if (master.status === 401 && session.playId) {
+      await refreshPlayback(session);
+      master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    }
     if (!master.ok) throw new Error(`Stream master HTTP ${master.status}`);
     const masterText = await master.text();
     const lines = masterText.split(/\r?\n/);
@@ -877,7 +930,11 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
     }
 
     if (variant) {
-      const variantRes = await streamFetch(session, variant, {}, req.headers);
+      let variantRes = await streamFetch(session, variant, {}, req.headers);
+      if (variantRes.status === 401 && session.playId) {
+        await refreshPlayback(session);
+        variantRes = await streamFetch(session, variant, {}, req.headers);
+      }
       if (!variantRes.ok) throw new Error(`Variant HTTP ${variantRes.status}`);
       return rewritePlaylist(
         req.params.sessionId, session, await variantRes.text(), variant, res, req.headers
@@ -912,7 +969,10 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
       const uri = line.match(/URI="([^"]+)"/)?.[1];
       const ivHex = line.match(/IV=(0x[0-9a-fA-F]+|[0-9a-fA-F]{32})/i)?.[1];
       if (ivHex) currentIv = parseIvHex(ivHex);
-      if (uri && !keyFetched) {
+      if (uri && !keyFetched && session.plainKey) {
+        session.defaultIv = currentIv;
+        keyFetched = true;
+      } else if (uri && !keyFetched) {
         const keyUrl = new URL(uri, baseUrl).href;
         try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
         const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
@@ -971,6 +1031,15 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
       Range: req.headers.range || undefined
     }, req.headers);
     if (!upstream.ok && upstream.status !== 206) {
+      const body = (await upstream.text().catch(() => "")).slice(0, 300);
+      console.error("[segment-fail]", {
+        status: upstream.status,
+        host: new URL(url).hostname,
+        server: upstream.headers.get("server"),
+        cfRay: upstream.headers.get("cf-ray"),
+        ageSec: Math.round((now() - session.createdAt) / 1000),
+        body
+      });
       throw new Error(`Segment HTTP ${upstream.status}`);
     }
     const encrypted = Buffer.from(await upstream.arrayBuffer());
@@ -1478,7 +1547,7 @@ setInterval(() => {
     if (s.expiresAt && t > s.expiresAt) adminSessions.delete(k);
   }
   for (const [k, s] of streamSessions) {
-    if (t - s.createdAt > CONFIG.STREAM_SESSION_MS) streamSessions.delete(k);
+    if (t - (s.lastUsed || s.createdAt) > CONFIG.STREAM_SESSION_MS) streamSessions.delete(k);
   }
 }, 60_000).unref();
 
