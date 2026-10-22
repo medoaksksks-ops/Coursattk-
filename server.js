@@ -79,13 +79,14 @@ const CONFIG = {
     "api.coursatk.online",
     "stream-weave.com",
     "floravon.online",
+    "floravon.shop",   // new CDN domain used for segments
     "c-cdn.online"
   ],
   STREAM_ORIGIN: "https://coursatk.online",
   STREAM_REFERER: "https://coursatk.online/",
   STREAM_X_REQUESTED_WITH: "com.mycompany.app.soulbrowser",
   STREAM_UA:
-    "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/153.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36",
   PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
   // Firebase RTDB (open rules as provided)
   FIREBASE: "https://english-73376-default-rtdb.firebaseio.com",
@@ -503,7 +504,6 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
   const ch = clientHeaders || {};
   const headers = {
-    Authorization: `Bearer ${session.token}`,
     Accept: "*/*",
     "Cache-Control": "no-cache",
     Origin: CONFIG.STREAM_ORIGIN,
@@ -511,6 +511,15 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
     "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA
   };
+
+  // Master playlist + key on api.stream-weave.com NEED Authorization.
+  // Actual media segments on floravon.* / c-cdn.* use only the query token
+  // and must NOT receive Authorization (browser also doesn't send it).
+  const isMediaSegmentHost = /floravon\.(online|shop)|c-cdn\.online/i.test(url);
+  if (!isMediaSegmentHost && session?.token) {
+    headers.Authorization = `Bearer ${session.token}`;
+  }
+
   for (const name of [
     "sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile",
     "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "accept-language"
@@ -1049,8 +1058,13 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
     let plain;
     try {
       plain = decryptSegment(encrypted, session.plainKey, iv);
-    } catch {
-      plain = encrypted;
+    } catch (decErr) {
+      console.warn("[segment-decrypt-fail]", {
+        host: new URL(url).hostname,
+        len: encrypted.length,
+        err: decErr.message
+      });
+      plain = encrypted; // fallback: send as-is (may still fail to play)
     }
     res.status(200);
     res.set({
